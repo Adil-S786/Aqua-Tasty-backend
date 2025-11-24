@@ -19,7 +19,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Water Plant API")
 
-origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://aqua-tasty.vercel.app"]
 # For local development we also allow LAN IPs (e.g. http://192.168.1.6:3000)
 # Use a regex to match 192.168.x.x origins on port 3000.
 allow_origin_regex = r"^http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+):3000$"
