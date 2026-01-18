@@ -9,9 +9,9 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
 @router.get("")
-def list_payments(db: Session = Depends(get_db)):
-    """List all payments with joined customer name if available."""
-    results = (
+def list_payments(customer_id: int = None, db: Session = Depends(get_db)):
+    """List all payments with joined customer name if available. Optionally filter by customer_id."""
+    query = (
         db.query(
             PaymentHistory.id,
             PaymentHistory.customer_id,
@@ -21,9 +21,13 @@ def list_payments(db: Session = Depends(get_db)):
             Customer.name.label("profile_name"),
         )
         .outerjoin(Customer, PaymentHistory.customer_id == Customer.id)
-        .order_by(PaymentHistory.date.desc())
-        .all()
     )
+    
+    # Filter by customer_id if provided
+    if customer_id:
+        query = query.filter(PaymentHistory.customer_id == customer_id)
+    
+    results = query.order_by(PaymentHistory.date.desc()).all()
 
     return [
         {
