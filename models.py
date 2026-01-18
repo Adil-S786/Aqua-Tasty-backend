@@ -12,6 +12,7 @@ class Customer(Base):
     fixed_price_per_jar = Column(Float, nullable=True)
     delivery_type = Column(String, default="self")  # NEW FIELD ("self" or "delivery")
     active = Column(Boolean, default=True)
+    advance_payment = Column(Float, default=0.0)  # Track advance payments
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())   # for new customers filtering
 

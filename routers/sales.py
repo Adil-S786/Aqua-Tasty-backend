@@ -22,22 +22,23 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
     customer_id = None
     customer_name = None
     cost_per_jar = payload.cost_per_jar
+    customer = None
 
     # Profiled Sale
     if payload.is_profiled:
         if not payload.customer_id:
             raise HTTPException(status_code=400, detail="Please select a profiled customer")
 
-        cust = db.query(Customer).filter(Customer.id == payload.customer_id).first()
-        if not cust:
+        customer = db.query(Customer).filter(Customer.id == payload.customer_id).first()
+        if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        customer_id = cust.id
-        customer_name = cust.name
+        customer_id = customer.id
+        customer_name = customer.name
 
         if cost_per_jar is None:
-            if cust.fixed_price_per_jar is not None:
-                cost_per_jar = cust.fixed_price_per_jar
+            if customer.fixed_price_per_jar is not None:
+                cost_per_jar = customer.fixed_price_per_jar
             else:
                 raise HTTPException(status_code=400, detail="cost_per_jar required (customer has no fixed price)")
 
@@ -52,6 +53,7 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
         )
 
         if matching_customer:
+            customer = matching_customer
             customer_id = matching_customer.id
             customer_name = matching_customer.name
             payload.is_profiled = True
@@ -68,7 +70,70 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
 
     our_jars = payload.total_jars - payload.customer_own_jars
     total_cost = payload.total_jars * cost_per_jar
-    due_amount = max(0.0, total_cost - payload.amount_paid)
+    
+    # ⭐ PROPER ADVANCE + PAYMENT LOGIC
+    advance_payment_message = None
+    
+    # Calculate total payment needed (old dues + current sale)
+    total_payment_needed = total_cost
+    
+    if customer_id:
+        # Get all old dues (FIFO - oldest first)
+        old_dues = (
+            db.query(Sale)
+            .filter(Sale.customer_id == customer_id, Sale.due_amount > 0)
+            .order_by(Sale.date.asc())
+            .all()
+        )
+        
+        total_old_dues = sum(s.due_amount for s in old_dues)
+        total_payment_needed += total_old_dues
+        
+        # Total available = advance + actual payment
+        existing_advance = customer.advance_payment if customer else 0
+        total_available = existing_advance + payload.amount_paid
+        
+        # Settle old dues first (FIFO)
+        remaining_payment = total_available
+        for old_sale in old_dues:
+            if remaining_payment <= 0:
+                break
+            
+            if remaining_payment >= old_sale.due_amount:
+                remaining_payment -= old_sale.due_amount
+                old_sale.amount_paid += old_sale.due_amount
+                old_sale.due_amount = 0
+            else:
+                old_sale.amount_paid += remaining_payment
+                old_sale.due_amount -= remaining_payment
+                remaining_payment = 0
+            
+            db.add(old_sale)
+        
+        # After settling old dues, use remaining for current sale
+        amount_paid_for_current = min(remaining_payment, total_cost)
+        due_amount = total_cost - amount_paid_for_current
+        
+        # Calculate final advance
+        final_advance = max(0, remaining_payment - total_cost)
+        
+        # Update customer advance and show message
+        if customer:
+            advance_change = final_advance - existing_advance
+            customer.advance_payment = final_advance
+            
+            if existing_advance > 0 and final_advance < existing_advance:
+                advance_payment_message = f"₹{existing_advance - final_advance:.2f} advance used. Remaining: ₹{final_advance:.2f}"
+            elif final_advance > existing_advance:
+                advance_payment_message = f"₹{advance_change:.2f} added to advance. Total advance: ₹{final_advance:.2f}"
+            elif final_advance > 0 and existing_advance == 0:
+                advance_payment_message = f"₹{final_advance:.2f} recorded as advance payment"
+            
+            db.add(customer)
+    else:
+        # Walk-in customer - no advance payment
+        amount_paid_for_current = payload.amount_paid
+        due_amount = max(0, total_cost - amount_paid_for_current)
 
     sale = Sale(
         customer_id=customer_id,
@@ -78,7 +143,7 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
         our_jars=our_jars,
         cost_per_jar=cost_per_jar,
         total_cost=total_cost,
-        amount_paid=payload.amount_paid,
+        amount_paid=amount_paid_for_current,
         due_amount=due_amount,
         date=payload.sale_date or None,
     )
@@ -86,11 +151,11 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(sale)
 
-    if sale.amount_paid > 0:
+    if payload.amount_paid > 0:
         payment = PaymentHistory(
             customer_id=sale.customer_id,
             customer_name=sale.customer_name,
-            amount_paid=sale.amount_paid
+            amount_paid=payload.amount_paid
         )
         db.add(payment)
         db.commit()
@@ -141,7 +206,15 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
             from services.smart_reminder_service import update_customer_reminder_after_sale
             update_customer_reminder_after_sale(sale.customer_id, db)
 
-    return sale
+    response = {
+        "sale": sale,
+        "message": "Sale created successfully"
+    }
+    
+    if advance_payment_message:
+        response["advance_payment_message"] = advance_payment_message
+    
+    return response
 
 
 @router.get("")
@@ -206,23 +279,46 @@ def pay_due(
     if not customer_id and not customer_name:
         raise HTTPException(status_code=400, detail="Customer ID or name required.")
 
+    # Get customer if profiled
+    customer = None
     if customer_id:
+        customer = db.query(Customer).filter(Customer.id == customer_id).first()
         due_sales = (
             db.query(Sale)
             .filter(Sale.customer_id == customer_id, Sale.due_amount > 0)
-            .order_by(Sale.date.asc())
+            .order_by(Sale.date.asc())  # FIFO - oldest first
             .all()
         )
     else:
         due_sales = (
             db.query(Sale)
             .filter(Sale.customer_name == customer_name, Sale.due_amount > 0)
-            .order_by(Sale.date.asc())
+            .order_by(Sale.date.asc())  # FIFO - oldest first
             .all()
         )
 
     if not due_sales:
-        raise HTTPException(status_code=404, detail="No due sales found for this customer.")
+        # No dues, treat as advance payment
+        if customer:
+            customer.advance_payment = (customer.advance_payment or 0.0) + amount
+            db.add(customer)
+            
+            payment_record = PaymentHistory(
+                customer_id=customer_id,
+                customer_name=customer_name,
+                amount_paid=amount,
+            )
+            db.add(payment_record)
+            db.commit()
+            
+            return {
+                "message": "No dues found. Amount recorded as advance payment.",
+                "paid_amount": amount,
+                "advance_payment": customer.advance_payment,
+                "total_due_now": 0
+            }
+        else:
+            raise HTTPException(status_code=404, detail="No due sales found for this customer.")
 
     remaining = amount
     for sale in due_sales:
@@ -240,10 +336,17 @@ def pay_due(
 
         db.add(sale)
 
+    # If there's remaining amount after settling all dues, record as advance
+    advance_message = None
+    if remaining > 0 and customer:
+        customer.advance_payment = (customer.advance_payment or 0.0) + remaining
+        db.add(customer)
+        advance_message = f"₹{remaining:.2f} recorded as advance payment"
+
     payment_record = PaymentHistory(
         customer_id=customer_id,
         customer_name=customer_name,
-        amount_paid=amount - remaining,
+        amount_paid=amount,
     )
     db.add(payment_record)
 
@@ -262,12 +365,17 @@ def pay_due(
             .scalar()
         ) or 0.0
 
-    return {
+    response = {
         "message": "Due payment recorded successfully.",
         "paid_amount": amount - remaining,
-        "remaining_unapplied": remaining,
         "total_due_now": total_due
     }
+    
+    if advance_message:
+        response["advance_payment_message"] = advance_message
+        response["advance_payment"] = customer.advance_payment if customer else 0
+    
+    return response
 
 
 @router.post("/total-due")
