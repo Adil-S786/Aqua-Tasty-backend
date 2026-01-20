@@ -109,13 +109,15 @@ def list_reminders(db: Session = Depends(get_db)):
 
 @router.get("/due/today")
 def get_today_reminders(db: Session = Depends(get_db)):
-    """Get reminders due today (for bell icon)"""
+    """Get reminders due today (for bell icon) - only pending/scheduled, delivery type, active customers"""
     try:
         today = datetime.now().date()
+        
+        # Get today's reminders with pending/scheduled status
         reminders = (
             db.query(Reminder)
             .filter(func.date(Reminder.next_date) == today)
-            .filter(Reminder.status == "pending")
+            .filter(Reminder.status.in_(["pending", "scheduled"]))
             .order_by(Reminder.next_date.asc())
             .all()
         )
@@ -129,12 +131,22 @@ def get_today_reminders(db: Session = Depends(get_db)):
                 customer_name = None
                 last_sale_date = None
                 activity_status = None
+                delivery_type = None
                 
                 if r.customer_id:
                     customer = db.query(Customer).filter(Customer.id == r.customer_id).first()
                     if customer:
                         customer_name = customer.name
                         activity_status = customer.activity_status
+                        delivery_type = customer.delivery_type
+                        
+                        # ⭐ Skip self-pickup customers
+                        if delivery_type != "delivery":
+                            continue
+                        
+                        # ⭐ Skip inactive customers
+                        if activity_status != "active":
+                            continue
                         
                         # Get last sale date
                         last_sale = (
@@ -145,6 +157,9 @@ def get_today_reminders(db: Session = Depends(get_db)):
                         )
                         if last_sale:
                             last_sale_date = last_sale.date.isoformat() if last_sale.date else None
+                else:
+                    # For custom reminders (no customer_id), include them
+                    pass
                 
                 result.append({
                     "id": r.id,
