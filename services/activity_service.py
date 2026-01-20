@@ -69,7 +69,7 @@ def detect_activity_status(customer_id: int, db: Session) -> str:
         if intervals:
             avg_interval = sum(intervals) / len(intervals)
             
-            # ⭐ NEW: Check for inactive (45+ days since last purchase)
+            # Check for inactive (45+ days since last purchase)
             if days_since_last_purchase > 45:
                 return "inactive"
             
@@ -131,12 +131,21 @@ def update_all_customers_activity_status(db: Session) -> dict:
 
 def mark_customer_inactive(customer_id: int, db: Session) -> bool:
     """
-    Manually mark a customer as inactive.
+    Manually mark a customer as inactive and delete all pending reminders.
     Returns True if successful.
     """
+    from models import Reminder
+    
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if customer:
         customer.activity_status = "inactive"
+        
+        # ⭐ NEW: Delete all pending/scheduled reminders for this customer
+        db.query(Reminder).filter(
+            Reminder.customer_id == customer_id,
+            Reminder.status.in_(["pending", "scheduled"])
+        ).delete(synchronize_session=False)
+        
         db.commit()
         db.refresh(customer)
         return True

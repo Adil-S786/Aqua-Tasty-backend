@@ -203,13 +203,9 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
                 db.add(todays_reminder)
                 db.commit()
             
-            # ⭐ NEW: Auto-update customer reminders based on pattern
+            # ⭐ Auto-update customer reminders and activity status based on pattern
             from services.smart_reminder_service import update_customer_reminder_after_sale
             update_customer_reminder_after_sale(sale.customer_id, db)
-    
-    # ⭐ Update activity status after sale
-    if customer_id:
-        update_customer_activity_status(customer_id, db)
 
     response = {
         "sale": sale,

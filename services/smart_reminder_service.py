@@ -34,16 +34,19 @@ def analyze_customer_pattern(customer_id: int, db: Session):
 
 def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
     """
-    Generate reminders for ACTIVE customers who are due based on their patterns.
-    Only creates reminders for customers with activity_status = 'active'.
+    Generate reminders for ACTIVE DELIVERY customers who are due based on their patterns.
+    Only creates reminders for customers with:
+    - activity_status = 'active'
+    - delivery_type = 'delivery' (not self-pickup)
     
     Args:
         max_inactive_days: Maximum days since last sale to consider customer active (default: 60)
     """
-    # ⭐ NEW: Only get ACTIVE customers
+    # ⭐ NEW: Only get ACTIVE DELIVERY customers
     customers = db.query(Customer).filter(
         Customer.active == True,
-        Customer.activity_status == "active"
+        Customer.activity_status == "active",
+        Customer.delivery_type == "delivery"  # ⭐ Only delivery customers
     ).all()
     
     created = 0
@@ -152,13 +155,27 @@ def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
 
 
 def update_customer_reminder_after_sale(customer_id: int, db: Session):
-    """Update or create reminder after a sale is made - only for ACTIVE customers"""
+    """
+    Update or create reminder after a sale is made.
+    
+    ⭐ NEW BEHAVIOR:
+    - If customer was inactive, making a purchase will reactivate them
+    - Activity status is recalculated based on new purchase
+    - Only creates reminders for ACTIVE DELIVERY customers
+    """
     from datetime import timezone
     
-    # ⭐ NEW: Check if customer is active
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
-    if not customer or customer.activity_status != "active":
-        # Don't create auto-reminders for non-active customers
+    if not customer:
+        return
+    
+    # ⭐ NEW: Recalculate activity status after purchase (this may change inactive → active)
+    new_status = detect_activity_status(customer_id, db)
+    customer.activity_status = new_status
+    db.commit()
+    
+    # Only proceed with reminder creation if customer is now active and has delivery
+    if customer.activity_status != "active" or customer.delivery_type != "delivery":
         return
     
     # Find pending reminders for this customer
@@ -174,6 +191,33 @@ def update_customer_reminder_after_sale(customer_id: int, db: Session):
     # Mark them as completed since customer just made a purchase
     for reminder in pending:
         reminder.status = "completed"
+
+    # Analyze pattern and create new reminder
+    avg_days = analyze_customer_pattern(customer_id, db)
+    if avg_days and avg_days > 0:
+        # Check if we need timezone-aware datetime
+        # Look at existing reminders to determine timezone usage
+        sample_reminder = db.query(Reminder).first()
+        if sample_reminder and sample_reminder.next_date and sample_reminder.next_date.tzinfo is not None:
+            # Use timezone-aware datetime
+            now = datetime.now(timezone.utc)
+        else:
+            # Use naive datetime
+            now = datetime.now()
+        
+        # Calculate from TODAY (actual purchase date), not old reminder date
+        next_date = now + timedelta(days=avg_days)
+        new_reminder = Reminder(
+            customer_id=customer_id,
+            reason="delivery",
+            frequency=avg_days,
+            next_date=next_date,
+            note=f"Auto-created after sale: Next delivery expected in {avg_days} days (from {now.strftime('%Y-%m-%d')})",
+            status="scheduled",
+        )
+        db.add(new_reminder)
+
+    db.commit()
 
     # Analyze pattern and create new reminder
     avg_days = analyze_customer_pattern(customer_id, db)
@@ -205,9 +249,10 @@ def update_customer_reminder_after_sale(customer_id: int, db: Session):
 
 def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     """
-    Auto-advance overdue reminders - ONLY for ACTIVE customers
+    Auto-advance overdue reminders - ONLY for ACTIVE DELIVERY customers
     - Yesterday's reminders → Move to TODAY
     - Older reminders → Skip cycles to next occurrence
+    - Only for customers with delivery_type = 'delivery'
     
     Args:
         days_overdue: How many days overdue before auto-advancing (default: 1)
@@ -222,7 +267,7 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     yesterday = today - timedelta(days=1)
     cutoff_date = now - timedelta(days=days_overdue)
     
-    # Find overdue reminders with frequency > 0, ONLY for ACTIVE customers
+    # Find overdue reminders with frequency > 0, ONLY for ACTIVE DELIVERY customers
     overdue_reminders = (
         db.query(Reminder)
         .join(Customer, Reminder.customer_id == Customer.id)
@@ -230,7 +275,8 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
             Reminder.next_date < cutoff_date,
             Reminder.status.in_(["pending", "scheduled"]),
             Reminder.frequency > 0,
-            Customer.activity_status == "active"  # ⭐ NEW: Only active customers
+            Customer.activity_status == "active",  # Only active customers
+            Customer.delivery_type == "delivery"  # ⭐ NEW: Only delivery customers
         )
         .all()
     )

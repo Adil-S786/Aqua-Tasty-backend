@@ -65,9 +65,24 @@ def list_reminders(db: Session = Depends(get_db)):
 
     for r in reminders:
         name = None
+        last_sale_date = None
+        activity_status = None
+        
         if r.customer_id:
             cust = db.query(Customer).filter(Customer.id == r.customer_id).first()
-            name = cust.name if cust else None
+            if cust:
+                name = cust.name
+                activity_status = cust.activity_status
+                
+                # Get last sale date
+                last_sale = (
+                    db.query(Sale)
+                    .filter(Sale.customer_id == r.customer_id)
+                    .order_by(Sale.date.desc())
+                    .first()
+                )
+                if last_sale:
+                    last_sale_date = last_sale.date.isoformat() if last_sale.date else None
 
         item = {
             "id": r.id,
@@ -80,6 +95,8 @@ def list_reminders(db: Session = Depends(get_db)):
             "note": r.note,
             "status": r.status,
             "created_at": r.created_at,
+            "last_sale_date": last_sale_date,
+            "activity_status": activity_status,
         }
 
         if r.customer_id:
@@ -92,7 +109,7 @@ def list_reminders(db: Session = Depends(get_db)):
 
 @router.get("/due/today")
 def get_today_reminders(db: Session = Depends(get_db)):
-    """Get reminders due today"""
+    """Get reminders due today (for bell icon)"""
     try:
         today = datetime.now().date()
         reminders = (
@@ -103,25 +120,36 @@ def get_today_reminders(db: Session = Depends(get_db)):
             .all()
         )
         
-        # If no reminders, return empty array
         if not reminders:
             return []
         
-        # Manually serialize with customer name lookup
         result = []
         for r in reminders:
             try:
-                # Get customer name if profiled
                 customer_name = None
+                last_sale_date = None
+                activity_status = None
+                
                 if r.customer_id:
                     customer = db.query(Customer).filter(Customer.id == r.customer_id).first()
                     if customer:
                         customer_name = customer.name
+                        activity_status = customer.activity_status
+                        
+                        # Get last sale date
+                        last_sale = (
+                            db.query(Sale)
+                            .filter(Sale.customer_id == r.customer_id)
+                            .order_by(Sale.date.desc())
+                            .first()
+                        )
+                        if last_sale:
+                            last_sale_date = last_sale.date.isoformat() if last_sale.date else None
                 
                 result.append({
                     "id": r.id,
                     "customer_id": r.customer_id,
-                    "customer_name": customer_name,  # ⭐ Added from Customer table
+                    "customer_name": customer_name,
                     "custom_name": r.custom_name,
                     "reason": r.reason or "delivery",
                     "frequency": r.frequency if r.frequency is not None else 0,
@@ -129,6 +157,8 @@ def get_today_reminders(db: Session = Depends(get_db)):
                     "note": r.note or "",
                     "status": r.status or "pending",
                     "created_at": r.created_at.isoformat() if r.created_at else datetime.now().isoformat(),
+                    "last_sale_date": last_sale_date,
+                    "activity_status": activity_status,
                 })
             except Exception as e:
                 print(f"Error serializing reminder {r.id}: {str(e)}")
@@ -139,7 +169,6 @@ def get_today_reminders(db: Session = Depends(get_db)):
         print(f"Error in get_today_reminders: {str(e)}")
         import traceback
         traceback.print_exc()
-        # Return empty list instead of raising error
         return []
 
 
@@ -166,10 +195,24 @@ async def get_overdue_reminders(db: Session = Depends(get_db)):
         for r in reminders:
             try:
                 customer_name = None
+                last_sale_date = None
+                activity_status = None
+                
                 if r.customer_id:
                     customer = db.query(Customer).filter(Customer.id == r.customer_id).first()
                     if customer:
                         customer_name = customer.name
+                        activity_status = customer.activity_status
+                        
+                        # Get last sale date
+                        last_sale = (
+                            db.query(Sale)
+                            .filter(Sale.customer_id == r.customer_id)
+                            .order_by(Sale.date.desc())
+                            .first()
+                        )
+                        if last_sale:
+                            last_sale_date = last_sale.date.isoformat() if last_sale.date else None
                 
                 result.append({
                     "id": r.id,
@@ -182,6 +225,8 @@ async def get_overdue_reminders(db: Session = Depends(get_db)):
                     "note": r.note or "",
                     "status": r.status or "pending",
                     "created_at": r.created_at.isoformat() if r.created_at else now.isoformat(),
+                    "last_sale_date": last_sale_date,
+                    "activity_status": activity_status,
                 })
             except Exception:
                 continue
@@ -386,7 +431,11 @@ def generate_smart_reminders_endpoint(
     db: Session = Depends(get_db)
 ):
     """
-    Analyze customer patterns and auto-generate reminders for customers who are due
+    Analyze customer patterns and auto-generate reminders for DELIVERY customers who are due
+    
+    Only creates reminders for customers with:
+    - activity_status = 'active'
+    - delivery_type = 'delivery' (not self-pickup)
     
     Parameters:
     - max_inactive_days: Maximum days since last sale to consider customer active (default: 60)
@@ -408,12 +457,14 @@ def auto_advance_overdue_reminders_endpoint(
     db: Session = Depends(get_db)
 ):
     """
-    Auto-advance overdue reminders - ONLY for ACTIVE customers
+    Auto-advance overdue reminders - ONLY for ACTIVE DELIVERY customers
     
     Behavior:
     - Yesterday's reminders → Moved to TODAY
     - Older reminders → Skip cycles to next occurrence
-    - Only affects customers with activity_status = "active"
+    - Only affects customers with:
+      - activity_status = "active"
+      - delivery_type = "delivery" (not self-pickup)
     
     Parameters:
     - days_overdue: How many days overdue before advancing (default: 1)
@@ -421,7 +472,7 @@ def auto_advance_overdue_reminders_endpoint(
     This is useful for:
     - Daily cleanup of overdue reminders
     - Moving yesterday's missed deliveries to today
-    - Automatically rescheduling for active customers only
+    - Automatically rescheduling for active delivery customers only
     """
     from services.smart_reminder_service import auto_advance_overdue_reminders
     result = auto_advance_overdue_reminders(db, days_overdue)
