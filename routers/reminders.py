@@ -16,6 +16,25 @@ def create_reminder(payload: ReminderCreate, db: Session = Depends(get_db)):
     if not payload.customer_id and not payload.custom_name:
         raise HTTPException(400, "Either customer_id or custom_name is required")
 
+    # ⭐ NEW: If creating manual reminder for a customer, delete auto-generated ones
+    if payload.customer_id:
+        # Find and delete auto-generated reminders (those with "Auto-" in note)
+        auto_reminders = (
+            db.query(Reminder)
+            .filter(
+                Reminder.customer_id == payload.customer_id,
+                Reminder.status.in_(["pending", "scheduled"]),
+                Reminder.note.like("%Auto-%")  # Auto-generated or Auto-created
+            )
+            .all()
+        )
+        
+        for auto_reminder in auto_reminders:
+            db.delete(auto_reminder)
+        
+        if auto_reminders:
+            db.commit()  # Commit deletion before creating new one
+
     r = Reminder(
         customer_id=payload.customer_id,
         custom_name=payload.custom_name,
@@ -69,6 +88,108 @@ def list_reminders(db: Session = Depends(get_db)):
             customs.append(item)
 
     return {"profiled": profiled, "customs": customs}
+
+
+@router.get("/due/today")
+def get_today_reminders(db: Session = Depends(get_db)):
+    """Get reminders due today"""
+    try:
+        today = datetime.now().date()
+        reminders = (
+            db.query(Reminder)
+            .filter(func.date(Reminder.next_date) == today)
+            .filter(Reminder.status == "pending")
+            .order_by(Reminder.next_date.asc())
+            .all()
+        )
+        
+        # If no reminders, return empty array
+        if not reminders:
+            return []
+        
+        # Manually serialize with customer name lookup
+        result = []
+        for r in reminders:
+            try:
+                # Get customer name if profiled
+                customer_name = None
+                if r.customer_id:
+                    customer = db.query(Customer).filter(Customer.id == r.customer_id).first()
+                    if customer:
+                        customer_name = customer.name
+                
+                result.append({
+                    "id": r.id,
+                    "customer_id": r.customer_id,
+                    "customer_name": customer_name,  # ⭐ Added from Customer table
+                    "custom_name": r.custom_name,
+                    "reason": r.reason or "delivery",
+                    "frequency": r.frequency if r.frequency is not None else 0,
+                    "next_date": r.next_date.isoformat() if r.next_date else datetime.now().isoformat(),
+                    "note": r.note or "",
+                    "status": r.status or "pending",
+                    "created_at": r.created_at.isoformat() if r.created_at else datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"Error serializing reminder {r.id}: {str(e)}")
+                continue
+        
+        return result
+    except Exception as e:
+        print(f"Error in get_today_reminders: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Return empty list instead of raising error
+        return []
+
+
+@router.get("/overdue")
+async def get_overdue_reminders(db: Session = Depends(get_db)):
+    """Get all overdue reminders (past due date and still pending/scheduled)"""
+    from datetime import timezone
+    
+    try:
+        now = datetime.now(timezone.utc)
+        
+        reminders = (
+            db.query(Reminder)
+            .filter(Reminder.next_date < now)
+            .filter(Reminder.status.in_(["pending", "scheduled"]))
+            .order_by(Reminder.next_date.asc())
+            .all()
+        )
+        
+        if not reminders:
+            return []
+        
+        result = []
+        for r in reminders:
+            try:
+                customer_name = None
+                if r.customer_id:
+                    customer = db.query(Customer).filter(Customer.id == r.customer_id).first()
+                    if customer:
+                        customer_name = customer.name
+                
+                result.append({
+                    "id": r.id,
+                    "customer_id": r.customer_id,
+                    "customer_name": customer_name,
+                    "custom_name": r.custom_name,
+                    "reason": r.reason or "delivery",
+                    "frequency": r.frequency if r.frequency is not None else 0,
+                    "next_date": r.next_date.isoformat() if r.next_date else now.isoformat(),
+                    "note": r.note or "",
+                    "status": r.status or "pending",
+                    "created_at": r.created_at.isoformat() if r.created_at else now.isoformat(),
+                })
+            except Exception:
+                continue
+        
+        return result
+        
+    except Exception:
+        return []
 
 
 @router.get("/{reminder_id}", response_model=ReminderOut)
@@ -190,94 +311,42 @@ def complete_reminder(reminder_id: int, db: Session = Depends(get_db)):
         raise HTTPException(500, f"Failed to complete reminder: {str(e)}")
 
 
-@router.get("/due/today")
-def get_today_reminders(db: Session = Depends(get_db)):
-    """Get reminders due today"""
+@router.post("/{reminder_id}/move-tomorrow")
+def move_reminder_to_tomorrow(reminder_id: int, db: Session = Depends(get_db)):
+    """Move reminder to tomorrow (same time)"""
     try:
-        today = datetime.now().date()
-        reminders = (
-            db.query(Reminder)
-            .filter(func.date(Reminder.next_date) == today)
-            .filter(Reminder.status == "pending")
-            .order_by(Reminder.next_date.asc())
-            .all()
-        )
-        
-        # If no reminders, return empty array
-        if not reminders:
-            return []
-        
-        # Manually serialize with safe defaults
-        result = []
-        for r in reminders:
-            try:
-                result.append({
-                    "id": r.id,
-                    "customer_id": r.customer_id,
-                    "custom_name": r.custom_name,
-                    "reason": r.reason or "delivery",
-                    "frequency": r.frequency if r.frequency is not None else 0,
-                    "next_date": r.next_date.isoformat() if r.next_date else datetime.now().isoformat(),
-                    "note": r.note or "",
-                    "status": r.status or "pending",
-                    "created_at": r.created_at.isoformat() if r.created_at else datetime.now().isoformat(),
-                })
-            except Exception as e:
-                print(f"Error serializing reminder {r.id}: {str(e)}")
-                continue
-        
-        return result
-    except Exception as e:
-        print(f"Error in get_today_reminders: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        # Return empty list instead of raising error
-        return []
+        r = db.query(Reminder).filter(Reminder.id == reminder_id).first()
+        if not r:
+            raise HTTPException(404, "Reminder not found")
 
-
-@router.get("/overdue")
-def get_overdue_reminders(db: Session = Depends(get_db)):
-    """Get all overdue reminders (past due date and still pending/scheduled)"""
-    try:
-        now = datetime.now()
-        reminders = (
-            db.query(Reminder)
-            .filter(Reminder.next_date < now)
-            .filter(Reminder.status.in_(["pending", "scheduled"]))
-            .order_by(Reminder.next_date.asc())
-            .all()
-        )
+        # Get tomorrow's date with same time
+        current_date = r.next_date
+        tomorrow = current_date + timedelta(days=1)
         
-        # If no reminders, return empty array
-        if not reminders:
-            return []
+        # Update reminder
+        old_date = r.next_date.strftime('%Y-%m-%d')
+        r.next_date = tomorrow
+        r.status = "pending"
         
-        # Manually serialize with safe defaults
-        result = []
-        for r in reminders:
-            try:
-                result.append({
-                    "id": r.id,
-                    "customer_id": r.customer_id,
-                    "custom_name": r.custom_name,
-                    "reason": r.reason or "delivery",
-                    "frequency": r.frequency if r.frequency is not None else 0,
-                    "next_date": r.next_date.isoformat() if r.next_date else datetime.now().isoformat(),
-                    "note": r.note or "",
-                    "status": r.status or "pending",
-                    "created_at": r.created_at.isoformat() if r.created_at else datetime.now().isoformat(),
-                })
-            except Exception as e:
-                print(f"Error serializing reminder {r.id}: {str(e)}")
-                continue
+        # Update note
+        if r.note:
+            r.note += f" | Moved to tomorrow on {datetime.now().strftime('%Y-%m-%d')}"
+        else:
+            r.note = f"Moved to tomorrow on {datetime.now().strftime('%Y-%m-%d')}"
         
-        return result
+        db.commit()
+        db.refresh(r)
+        
+        return {
+            "message": f"Reminder moved from {old_date} to tomorrow",
+            "reminder_id": r.id,
+            "new_date": r.next_date.isoformat()
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in get_overdue_reminders: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        # Return empty list instead of raising error
-        return []
+        print(f"Error moving reminder: {str(e)}")
+        raise HTTPException(500, f"Failed to move reminder: {str(e)}")
 
 
 @router.post("/{reminder_id}/advance")
@@ -339,21 +408,28 @@ def auto_advance_overdue_reminders_endpoint(
     db: Session = Depends(get_db)
 ):
     """
-    Auto-advance overdue reminders to their next occurrence
+    Auto-advance overdue reminders - ONLY for ACTIVE customers
+    
+    Behavior:
+    - Yesterday's reminders → Moved to TODAY
+    - Older reminders → Skip cycles to next occurrence
+    - Only affects customers with activity_status = "active"
     
     Parameters:
     - days_overdue: How many days overdue before advancing (default: 1)
     
     This is useful for:
     - Daily cleanup of overdue reminders
-    - Preventing reminder list from getting cluttered
-    - Automatically rescheduling missed deliveries
+    - Moving yesterday's missed deliveries to today
+    - Automatically rescheduling for active customers only
     """
     from services.smart_reminder_service import auto_advance_overdue_reminders
-    advanced = auto_advance_overdue_reminders(db, days_overdue)
+    result = auto_advance_overdue_reminders(db, days_overdue)
     return {
-        "advanced": advanced,
-        "message": f"Advanced {advanced} overdue reminders to their next occurrence"
+        "total_advanced": result["total_advanced"],
+        "moved_to_today": result["moved_to_today"],
+        "skipped_cycles": result["skipped_cycles"],
+        "message": f"Advanced {result['total_advanced']} reminders: {result['moved_to_today']} moved to today, {result['skipped_cycles']} skipped cycles"
     }
 
 

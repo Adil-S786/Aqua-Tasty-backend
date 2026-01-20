@@ -34,12 +34,18 @@ def analyze_customer_pattern(customer_id: int, db: Session):
 
 def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
     """
-    Generate reminders for customers who are due based on their patterns
+    Generate reminders for ACTIVE customers who are due based on their patterns.
+    Only creates reminders for customers with activity_status = 'active'.
     
     Args:
         max_inactive_days: Maximum days since last sale to consider customer active (default: 60)
     """
-    customers = db.query(Customer).filter(Customer.active == True).all()
+    # ⭐ NEW: Only get ACTIVE customers
+    customers = db.query(Customer).filter(
+        Customer.active == True,
+        Customer.activity_status == "active"
+    ).all()
+    
     created = 0
     skipped = 0
     inactive = 0
@@ -146,8 +152,14 @@ def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
 
 
 def update_customer_reminder_after_sale(customer_id: int, db: Session):
-    """Update or create reminder after a sale is made"""
+    """Update or create reminder after a sale is made - only for ACTIVE customers"""
     from datetime import timezone
+    
+    # ⭐ NEW: Check if customer is active
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer or customer.activity_status != "active":
+        # Don't create auto-reminders for non-active customers
+        return
     
     # Find pending reminders for this customer
     pending = (
@@ -193,7 +205,9 @@ def update_customer_reminder_after_sale(customer_id: int, db: Session):
 
 def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     """
-    Auto-advance overdue reminders to next occurrence
+    Auto-advance overdue reminders - ONLY for ACTIVE customers
+    - Yesterday's reminders → Move to TODAY
+    - Older reminders → Skip cycles to next occurrence
     
     Args:
         days_overdue: How many days overdue before auto-advancing (default: 1)
@@ -204,20 +218,26 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     from datetime import timezone
     
     now = datetime.now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
     cutoff_date = now - timedelta(days=days_overdue)
     
-    # Find overdue reminders with frequency > 0
+    # Find overdue reminders with frequency > 0, ONLY for ACTIVE customers
     overdue_reminders = (
         db.query(Reminder)
+        .join(Customer, Reminder.customer_id == Customer.id)
         .filter(
             Reminder.next_date < cutoff_date,
             Reminder.status.in_(["pending", "scheduled"]),
-            Reminder.frequency > 0
+            Reminder.frequency > 0,
+            Customer.activity_status == "active"  # ⭐ NEW: Only active customers
         )
         .all()
     )
     
     advanced = 0
+    moved_to_today = 0
+    
     for reminder in overdue_reminders:
         # Handle timezone-aware dates
         next_date = reminder.next_date
@@ -226,23 +246,47 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
             if next_date.tzinfo != timezone.utc:
                 next_date = next_date.astimezone(timezone.utc)
             days_overdue_count = (now_aware - next_date).days
+            reminder_date = next_date.date()
         else:
             days_overdue_count = (now - next_date).days
+            reminder_date = next_date.date()
         
-        # Calculate how many cycles to skip
-        cycles_to_skip = (days_overdue_count // reminder.frequency) + 1
-        
-        # Advance to next occurrence
-        reminder.next_date = reminder.next_date + timedelta(days=reminder.frequency * cycles_to_skip)
-        reminder.status = "scheduled"
-        
-        # Update note
-        if reminder.note:
-            reminder.note += f" | Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
+        # ⭐ NEW: If reminder was yesterday, just move to today
+        if reminder_date == yesterday:
+            # Move to today (same time)
+            if next_date.tzinfo is not None:
+                reminder.next_date = datetime.combine(today, next_date.time()).replace(tzinfo=next_date.tzinfo)
+            else:
+                reminder.next_date = datetime.combine(today, next_date.time())
+            
+            reminder.status = "pending"
+            
+            # Update note
+            if reminder.note:
+                reminder.note += f" | Moved from yesterday to today on {now.strftime('%Y-%m-%d')}"
+            else:
+                reminder.note = f"Moved from yesterday to today on {now.strftime('%Y-%m-%d')}"
+            
+            moved_to_today += 1
         else:
-            reminder.note = f"Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
+            # For older reminders, calculate cycles to skip
+            cycles_to_skip = (days_overdue_count // reminder.frequency) + 1
+            
+            # Advance to next occurrence
+            reminder.next_date = reminder.next_date + timedelta(days=reminder.frequency * cycles_to_skip)
+            reminder.status = "scheduled"
+            
+            # Update note
+            if reminder.note:
+                reminder.note += f" | Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
+            else:
+                reminder.note = f"Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
         
         advanced += 1
     
     db.commit()
-    return advanced
+    return {
+        "total_advanced": advanced,
+        "moved_to_today": moved_to_today,
+        "skipped_cycles": advanced - moved_to_today
+    }

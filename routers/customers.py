@@ -7,6 +7,7 @@ from datetime import datetime
 from dependencies import get_db
 from schemas import CustomerCreate, CustomerUpdate, ConvertWalkIn
 from models import Customer, Sale, JarTracking, Reminder
+from services.activity_service import update_customer_activity_status, update_all_customers_activity_status, mark_customer_inactive
 
 router = APIRouter(prefix="/customers", tags=["Customers"])
 
@@ -50,8 +51,18 @@ def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)):
 
 
 @router.get("")
-def list_customers(db: Session = Depends(get_db)):
-    return db.query(Customer).order_by(Customer.name).all()
+def list_customers(activity_status: str = None, db: Session = Depends(get_db)):
+    """
+    List customers with optional activity_status filter.
+    
+    Valid filters: inactive, onetime, occasional, was_regular, active, no_pattern
+    """
+    query = db.query(Customer)
+    
+    if activity_status:
+        query = query.filter(Customer.activity_status == activity_status)
+    
+    return query.order_by(Customer.name).all()
 
 
 @router.put("/{customer_id}")
@@ -186,3 +197,33 @@ def check_customer_name(name: str, db: Session = Depends(get_db)):
         .first()
     )
     return {"exists": bool(exists)}
+
+
+@router.post("/update-activity-status")
+def update_all_activity_statuses(db: Session = Depends(get_db)):
+    """
+    Update activity status for all customers based on their purchase patterns.
+    This should be run after migration or periodically to refresh statuses.
+    """
+    status_counts = update_all_customers_activity_status(db)
+    return {
+        "message": "Activity statuses updated for all customers",
+        "summary": status_counts
+    }
+
+
+@router.post("/{customer_id}/mark-inactive")
+def mark_inactive(customer_id: int, db: Session = Depends(get_db)):
+    """
+    Manually mark a customer as inactive.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    success = mark_customer_inactive(customer_id, db)
+    if success:
+        return {"message": f"Customer {customer.name} marked as inactive"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to mark customer as inactive")
+

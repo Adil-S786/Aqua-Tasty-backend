@@ -10,6 +10,7 @@ from schemas import SaleCreate
 from models import Customer, Sale, JarTracking, PaymentHistory, Reminder
 from utils import normalize_name
 from services import recalc_jartracking
+from services.activity_service import update_customer_activity_status
 
 router = APIRouter(prefix="/sales", tags=["Sales"])
 
@@ -205,6 +206,10 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
             # ⭐ NEW: Auto-update customer reminders based on pattern
             from services.smart_reminder_service import update_customer_reminder_after_sale
             update_customer_reminder_after_sale(sale.customer_id, db)
+    
+    # ⭐ Update activity status after sale
+    if customer_id:
+        update_customer_activity_status(customer_id, db)
 
     response = {
         "sale": sale,
