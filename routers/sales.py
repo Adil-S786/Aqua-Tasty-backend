@@ -276,18 +276,40 @@ def pay_due(
     amount: float = Body(..., gt=0),
     db: Session = Depends(get_db)
 ):
-    """Pay due amount for either profiled or walk-in customers. Settles oldest sales first (FIFO)."""
+    """Pay due amount for either profiled or walk-in customers. Settles oldest sales first (FIFO).
+    For linked accounts, settles dues across all linked accounts."""
     if not customer_id and not customer_name:
         raise HTTPException(status_code=400, detail="Customer ID or name required.")
 
     # Get customer if profiled
     customer = None
+    account_ids = []
+    
     if customer_id:
         customer = db.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        # Determine all account IDs to include (for linked accounts)
+        account_ids = [customer_id]
+        
+        if customer.parent_customer_id:
+            # This is a child, get parent and all siblings
+            parent_id = customer.parent_customer_id
+            account_ids = [parent_id]
+            children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
+            account_ids.extend([c.id for c in children])
+        else:
+            # Check if this is a parent with children
+            children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
+            if children:
+                account_ids.extend([c.id for c in children])
+        
+        # Get all due sales from all linked accounts
         due_sales = (
             db.query(Sale)
-            .filter(Sale.customer_id == customer_id, Sale.due_amount > 0)
-            .order_by(Sale.date.asc())  # FIFO - oldest first
+            .filter(Sale.customer_id.in_(account_ids), Sale.due_amount > 0)
+            .order_by(Sale.date.asc())  # FIFO - oldest first across all accounts
             .all()
         )
     else:
@@ -322,6 +344,8 @@ def pay_due(
             raise HTTPException(status_code=404, detail="No due sales found for this customer.")
 
     remaining = amount
+    settled_accounts = set()  # Track which accounts had dues settled
+    
     for sale in due_sales:
         if remaining <= 0:
             break
@@ -336,6 +360,7 @@ def pay_due(
             remaining = 0
 
         db.add(sale)
+        settled_accounts.add(sale.customer_id)
 
     # If there's remaining amount after settling all dues, record as advance
     advance_message = None
@@ -344,16 +369,33 @@ def pay_due(
         db.add(customer)
         advance_message = f"₹{remaining:.2f} recorded as advance payment"
 
-    payment_record = PaymentHistory(
-        customer_id=customer_id,
-        customer_name=customer_name,
-        amount_paid=amount,
-    )
-    db.add(payment_record)
+    # Create payment records for all accounts that had dues settled
+    if customer_id and len(account_ids) > 1:
+        # For linked accounts, create payment record for the account being paid through
+        payment_record = PaymentHistory(
+            customer_id=customer_id,
+            customer_name=customer_name,
+            amount_paid=amount,
+        )
+        db.add(payment_record)
+    else:
+        payment_record = PaymentHistory(
+            customer_id=customer_id,
+            customer_name=customer_name,
+            amount_paid=amount,
+        )
+        db.add(payment_record)
 
     db.commit()
 
-    if customer_id:
+    # Calculate total remaining due across all linked accounts
+    if customer_id and len(account_ids) > 1:
+        total_due = (
+            db.query(func.sum(Sale.due_amount))
+            .filter(Sale.customer_id.in_(account_ids))
+            .scalar()
+        ) or 0.0
+    elif customer_id:
         total_due = (
             db.query(func.sum(Sale.due_amount))
             .filter(Sale.customer_id == customer_id)
@@ -369,7 +411,8 @@ def pay_due(
     response = {
         "message": "Due payment recorded successfully.",
         "paid_amount": amount - remaining,
-        "total_due_now": total_due
+        "total_due_now": total_due,
+        "settled_accounts": len(settled_accounts) if customer_id else 1
     }
     
     if advance_message:
@@ -385,16 +428,58 @@ def get_total_due(
     customer_name: Optional[str] = Body(None),
     db: Session = Depends(get_db)
 ):
-    """Return total due for a profiled or walk-in customer."""
+    """Return total due for a profiled or walk-in customer. For linked accounts, returns combined total."""
     if not customer_id and not customer_name:
         raise HTTPException(status_code=400, detail="Customer ID or name required")
 
     if customer_id:
+        # Check if customer has linked accounts
+        customer = db.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        print(f"DEBUG: Customer {customer_id} ({customer.name}), parent_customer_id: {customer.parent_customer_id}")
+        
+        # Determine all account IDs to include
+        account_ids = [customer_id]
+        
+        if customer.parent_customer_id:
+            # This is a child, get parent and all siblings
+            parent_id = customer.parent_customer_id
+            print(f"DEBUG: This is a child, parent_id: {parent_id}")
+            account_ids = [parent_id]
+            children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
+            account_ids.extend([c.id for c in children])
+            print(f"DEBUG: Found {len(children)} children: {[c.id for c in children]}")
+        else:
+            # Check if this is a parent with children
+            children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
+            if children:
+                account_ids.extend([c.id for c in children])
+                print(f"DEBUG: This is a parent with {len(children)} children: {[c.id for c in children]}")
+            else:
+                print(f"DEBUG: This is a standalone account (no parent, no children)")
+        
+        print(f"DEBUG: Final account_ids to query: {account_ids}")
+        
+        # Get total due from all linked accounts
         total_due = (
             db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
-            .filter(Sale.customer_id == customer_id)
+            .filter(Sale.customer_id.in_(account_ids))
             .scalar()
         )
+        
+        # Get individual dues for debugging
+        for acc_id in account_ids:
+            individual_due = (
+                db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
+                .filter(Sale.customer_id == acc_id)
+                .scalar()
+            )
+            acc = db.query(Customer).filter(Customer.id == acc_id).first()
+            print(f"DEBUG: Account {acc_id} ({acc.name if acc else 'Unknown'}): ₹{individual_due}")
+        
+        print(f"DEBUG: Total due calculated: ₹{total_due}")
     else:
         total_due = (
             db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
@@ -402,7 +487,7 @@ def get_total_due(
             .scalar()
         )
 
-    return {"total_due": float(total_due)}
+    return {"total_due": float(total_due), "account_ids": account_ids if customer_id else []}  # Return account_ids for debugging
 
 
 @router.delete("/{sale_id}")

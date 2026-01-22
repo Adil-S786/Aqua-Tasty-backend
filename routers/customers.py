@@ -6,7 +6,7 @@ from datetime import datetime
 
 from dependencies import get_db
 from schemas import CustomerCreate, CustomerUpdate, ConvertWalkIn
-from models import Customer, Sale, JarTracking, Reminder
+from models import Customer, Sale, JarTracking, Reminder, PaymentHistory
 from services.activity_service import update_customer_activity_status, update_all_customers_activity_status, mark_customer_inactive
 
 router = APIRouter(prefix="/customers", tags=["Customers"])
@@ -54,6 +54,7 @@ def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)):
 def list_customers(activity_status: str = None, db: Session = Depends(get_db)):
     """
     List customers with optional activity_status filter.
+    Returns customers with their individual total_due (NOT combined for linked accounts).
     
     Valid filters: inactive, onetime, occasional, was_regular, active, no_pattern
     """
@@ -62,7 +63,34 @@ def list_customers(activity_status: str = None, db: Session = Depends(get_db)):
     if activity_status:
         query = query.filter(Customer.activity_status == activity_status)
     
-    return query.order_by(Customer.name).all()
+    customers = query.order_by(Customer.name).all()
+    
+    # Add individual total_due for each customer
+    result = []
+    for customer in customers:
+        # Get total due for THIS customer only (not linked accounts)
+        total_due = (
+            db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
+            .filter(Sale.customer_id == customer.id)
+            .scalar()
+        )
+        
+        # Convert customer to dict and add total_due
+        customer_dict = {
+            "id": customer.id,
+            "name": customer.name,
+            "phone": customer.phone,
+            "address": customer.address,
+            "fixed_price_per_jar": customer.fixed_price_per_jar,
+            "delivery_type": customer.delivery_type,
+            "activity_status": customer.activity_status,
+            "advance_payment": customer.advance_payment,
+            "parent_customer_id": customer.parent_customer_id,
+            "total_due": float(total_due)  # Individual due, not combined
+        }
+        result.append(customer_dict)
+    
+    return result
 
 
 @router.put("/{customer_id}")
@@ -227,3 +255,164 @@ def mark_inactive(customer_id: int, db: Session = Depends(get_db)):
     else:
         raise HTTPException(status_code=500, detail="Failed to mark customer as inactive")
 
+
+
+@router.post("/{customer_id}/link")
+def link_customer_account(customer_id: int, parent_id: int, db: Session = Depends(get_db)):
+    """
+    Link a customer account to a parent account (e.g., shop to home).
+    Only parent accounts (those without parent_customer_id) can have children.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    parent = db.query(Customer).filter(Customer.id == parent_id).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Parent customer not found")
+    
+    # Prevent linking to a child account
+    if parent.parent_customer_id is not None:
+        raise HTTPException(status_code=400, detail="Cannot link to a child account. Please link to the parent account instead.")
+    
+    # Prevent self-linking
+    if customer_id == parent_id:
+        raise HTTPException(status_code=400, detail="Cannot link a customer to itself")
+    
+    # Prevent linking if already has a parent
+    if customer.parent_customer_id is not None:
+        raise HTTPException(status_code=400, detail="Customer is already linked to another account")
+    
+    customer.parent_customer_id = parent_id
+    db.commit()
+    db.refresh(customer)
+    
+    return {
+        "message": f"Successfully linked {customer.name} to {parent.name}",
+        "customer_id": customer_id,
+        "parent_id": parent_id
+    }
+
+
+@router.post("/{customer_id}/unlink")
+def unlink_customer_account(customer_id: int, db: Session = Depends(get_db)):
+    """
+    Unlink a customer account from its parent.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    if customer.parent_customer_id is None:
+        raise HTTPException(status_code=400, detail="Customer is not linked to any account")
+    
+    parent_id = customer.parent_customer_id
+    customer.parent_customer_id = None
+    db.commit()
+    db.refresh(customer)
+    
+    return {
+        "message": f"Successfully unlinked {customer.name}",
+        "customer_id": customer_id,
+        "previous_parent_id": parent_id
+    }
+
+
+@router.get("/{customer_id}/linked-accounts")
+def get_linked_accounts(customer_id: int, db: Session = Depends(get_db)):
+    """
+    Get all linked accounts (parent + children) for a customer.
+    Returns the parent and all its children.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # Determine the parent ID
+    if customer.parent_customer_id:
+        parent_id = customer.parent_customer_id
+    else:
+        parent_id = customer.id
+    
+    # Get parent
+    parent = db.query(Customer).filter(Customer.id == parent_id).first()
+    
+    # Get all children
+    children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
+    
+    return {
+        "parent": parent,
+        "children": children,
+        "total_accounts": 1 + len(children)
+    }
+
+
+@router.get("/{customer_id}/combined-bill")
+def get_combined_bill(customer_id: int, db: Session = Depends(get_db)):
+    """
+    Get combined bill for linked accounts.
+    Includes sales, dues, and jar tracking for parent + all children.
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # Determine the parent ID
+    if customer.parent_customer_id:
+        parent_id = customer.parent_customer_id
+    else:
+        parent_id = customer.id
+    
+    # Get all linked accounts
+    parent = db.query(Customer).filter(Customer.id == parent_id).first()
+    children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
+    all_accounts = [parent] + children
+    all_ids = [acc.id for acc in all_accounts]
+    
+    # Get combined sales with dues
+    due_sales = (
+        db.query(Sale)
+        .filter(Sale.customer_id.in_(all_ids), Sale.due_amount > 0)
+        .order_by(Sale.date.desc())
+        .all()
+    )
+    
+    # Calculate totals
+    total_due = sum(s.due_amount for s in due_sales)
+    
+    # Get jar tracking
+    total_jars_due = 0
+    for acc_id in all_ids:
+        jt = db.query(JarTracking).filter(JarTracking.customer_id == acc_id).first()
+        if jt:
+            total_jars_due += jt.current_due_jars
+    
+    # Get last payment
+    last_payment = (
+        db.query(PaymentHistory)
+        .filter(PaymentHistory.customer_id.in_(all_ids))
+        .order_by(PaymentHistory.date.desc())
+        .first()
+    )
+    
+    return {
+        "accounts": [{"id": acc.id, "name": acc.name, "type": "parent" if acc.id == parent_id else "child"} for acc in all_accounts],
+        "total_due": float(total_due),
+        "total_jars_due": int(total_jars_due),
+        "pending_sales": [
+            {
+                "id": s.id,
+                "customer_id": s.customer_id,
+                "customer_name": next((acc.name for acc in all_accounts if acc.id == s.customer_id), ""),
+                "date": s.date,
+                "total_cost": s.total_cost,
+                "amount_paid": s.amount_paid,
+                "due_amount": s.due_amount,
+            }
+            for s in due_sales
+        ],
+        "last_payment": {
+            "amount_paid": last_payment.amount_paid,
+            "date": last_payment.date,
+        } if last_payment else None,
+    }

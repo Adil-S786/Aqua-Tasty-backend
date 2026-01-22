@@ -14,6 +14,7 @@ class Customer(Base):
     active = Column(Boolean, default=True)
     advance_payment = Column(Float, default=0.0)  # Track advance payments
     activity_status = Column(String, default="no_pattern")  # inactive, onetime, occasional, was_regular, active, no_pattern
+    parent_customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)  # Link to parent account
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())   # for new customers filtering
 
