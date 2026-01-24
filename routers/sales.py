@@ -184,28 +184,28 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(jt)
 
-        # ⭐ ENHANCED: Update reminders after sale
-        if sale.customer_id:
-            # Mark today's reminder as completed
-            today = date.today()
-            todays_reminder = (
-                db.query(Reminder)
-                .filter(
-                    Reminder.customer_id == sale.customer_id,
-                    func.date(Reminder.next_date) == today,
-                    Reminder.status.in_(["pending", "scheduled", "rescheduled"])
-                )
-                .first()
+    # ⭐ ENHANCED: Update reminders after sale (moved outside jar block)
+    if sale.customer_id:
+        # Mark today's reminder as completed
+        today = date.today()
+        todays_reminder = (
+            db.query(Reminder)
+            .filter(
+                Reminder.customer_id == sale.customer_id,
+                func.date(Reminder.next_date) == today,
+                Reminder.status.in_(["pending", "scheduled", "rescheduled"])
             )
+            .first()
+        )
 
-            if todays_reminder:
-                todays_reminder.status = "completed"
-                db.add(todays_reminder)
-                db.commit()
-            
-            # ⭐ Auto-update customer reminders and activity status based on pattern
-            from services.smart_reminder_service import update_customer_reminder_after_sale
-            update_customer_reminder_after_sale(sale.customer_id, db)
+        if todays_reminder:
+            todays_reminder.status = "completed"
+            db.add(todays_reminder)
+            db.commit()
+        
+        # ⭐ Auto-update customer reminders and activity status based on pattern
+        from services.smart_reminder_service import update_customer_reminder_after_sale
+        update_customer_reminder_after_sale(sale.customer_id, db)
 
     response = {
         "sale": sale,
