@@ -262,6 +262,10 @@ def link_customer_account(customer_id: int, parent_id: int, db: Session = Depend
     """
     Link a customer account to a parent account (e.g., shop to home).
     Only parent accounts (those without parent_customer_id) can have children.
+    
+    When linking:
+    1. If either account has advance payment, use it to settle dues across both accounts (FIFO)
+    2. Store any remaining advance in the parent account
     """
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
@@ -283,15 +287,86 @@ def link_customer_account(customer_id: int, parent_id: int, db: Session = Depend
     if customer.parent_customer_id is not None:
         raise HTTPException(status_code=400, detail="Customer is already linked to another account")
     
-    customer.parent_customer_id = parent_id
-    db.commit()
-    db.refresh(customer)
+    print(f"🔗 LINKING ACCOUNTS: Customer {customer_id} ({customer.name}) → Parent {parent_id} ({parent.name})")
     
-    return {
+    # ⭐ NEW: Check if either account has advance payment
+    customer_advance = customer.advance_payment or 0
+    parent_advance = parent.advance_payment or 0
+    total_advance = customer_advance + parent_advance
+    
+    print(f"   Customer advance: ₹{customer_advance}, Parent advance: ₹{parent_advance}, Total: ₹{total_advance}")
+    
+    # Link the accounts first
+    customer.parent_customer_id = parent_id
+    db.add(customer)
+    db.commit()
+    
+    # ⭐ NEW: If there's any advance, use it to settle dues across both accounts
+    settlement_message = None
+    if total_advance > 0:
+        print(f"   Found ₹{total_advance} in advance payments, settling dues...")
+        
+        # Get all dues from both accounts (FIFO)
+        all_dues = (
+            db.query(Sale)
+            .filter(Sale.customer_id.in_([customer_id, parent_id]), Sale.due_amount > 0)
+            .order_by(Sale.date.asc(), Sale.id.asc())
+            .all()
+        )
+        
+        print(f"   Found {len(all_dues)} sales with dues:")
+        for s in all_dues:
+            print(f"     - Sale {s.id}: customer_id={s.customer_id}, date={s.date}, due=₹{s.due_amount}")
+        
+        # Apply advance using FIFO
+        remaining_advance = total_advance
+        settled_count = 0
+        
+        for due_sale in all_dues:
+            if remaining_advance <= 0:
+                break
+            
+            if remaining_advance >= due_sale.due_amount:
+                remaining_advance -= due_sale.due_amount
+                due_sale.amount_paid += due_sale.due_amount
+                due_sale.due_amount = 0
+                settled_count += 1
+                print(f"     ✅ Fully settled sale {due_sale.id}, remaining=₹{remaining_advance}")
+            else:
+                due_sale.amount_paid += remaining_advance
+                due_sale.due_amount -= remaining_advance
+                settled_count += 1
+                print(f"     ⚠️ Partially settled sale {due_sale.id}, new due=₹{due_sale.due_amount}")
+                remaining_advance = 0
+            
+            db.add(due_sale)
+        
+        # Clear advance from child account and store final advance in parent
+        customer.advance_payment = 0
+        parent.advance_payment = remaining_advance
+        
+        db.add(customer)
+        db.add(parent)
+        db.commit()
+        
+        print(f"   Settlement complete: {settled_count} sales settled, ₹{remaining_advance} remaining advance")
+        
+        if settled_count > 0:
+            settlement_message = f"Used ₹{total_advance - remaining_advance:.2f} advance to settle {settled_count} sale(s). Remaining advance: ₹{remaining_advance:.2f}"
+        else:
+            settlement_message = f"No dues to settle. ₹{remaining_advance:.2f} stored as advance in parent account."
+    
+    response = {
         "message": f"Successfully linked {customer.name} to {parent.name}",
         "customer_id": customer_id,
         "parent_id": parent_id
     }
+    
+    if settlement_message:
+        response["settlement_message"] = settlement_message
+        response["advance_payment"] = parent.advance_payment
+    
+    return response
 
 
 @router.post("/{customer_id}/unlink")

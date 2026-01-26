@@ -111,12 +111,10 @@ def list_reminders(db: Session = Depends(get_db)):
 def get_today_reminders(db: Session = Depends(get_db)):
     """Get reminders due today (for bell icon) - matches reminders page 'Today' filter"""
     try:
-        today = datetime.now().date()
-        
-        # Get today's reminders with pending/scheduled status
+        # Get ALL pending/scheduled reminders and filter in Python (same as frontend does)
+        # This ensures consistency with the reminders page "Today" filter
         reminders = (
             db.query(Reminder)
-            .filter(func.date(Reminder.next_date) == today)
             .filter(Reminder.status.in_(["pending", "scheduled"]))
             .order_by(Reminder.next_date.asc())
             .all()
@@ -125,9 +123,21 @@ def get_today_reminders(db: Session = Depends(get_db)):
         if not reminders:
             return []
         
+        # Filter for today (same logic as frontend ReminderTable)
+        from datetime import date
+        today = date.today()
+        
         result = []
         for r in reminders:
             try:
+                # Check if reminder is for today
+                if r.next_date:
+                    reminder_date = r.next_date.date() if hasattr(r.next_date, 'date') else r.next_date
+                    if reminder_date != today:
+                        continue
+                else:
+                    continue
+                
                 customer_name = None
                 last_sale_date = None
                 activity_status = None
@@ -279,7 +289,13 @@ def update_reminder_status(
     payload: dict = Body(...),
     db: Session = Depends(get_db)
 ):
-    """Update reminder status (skip, cancel, etc.)"""
+    """
+    Update reminder status (skip, cancel, etc.)
+    
+    When status is "skipped":
+    - Marks current reminder as skipped
+    - Creates a new reminder for next occurrence (if frequency > 0)
+    """
     try:
         r = db.query(Reminder).filter(Reminder.id == reminder_id).first()
         if not r:
@@ -289,32 +305,111 @@ def update_reminder_status(
         if not status:
             raise HTTPException(400, "Status is required in request body")
 
-        if status == "skipped" and r.frequency and r.frequency > 0:
-            # Skip advances to next occurrence
-            r.next_date = r.next_date + timedelta(days=r.frequency)
-            r.status = "scheduled"
+        # ⭐ UPDATED: Skip current and create next occurrence
+        if status == "skipped" and r.frequency and int(r.frequency) > 0:
+            # Mark current as skipped
+            r.status = "skipped"
+            
+            # Replace note instead of appending
+            r.note = f"Skipped on {datetime.now().strftime('%Y-%m-%d')}"
+            
+            db.add(r)
+            db.commit()
+            
+            # Create new reminder for next occurrence
+            frequency_days = int(r.frequency)
+            next_date = r.next_date + timedelta(days=frequency_days)
+            
+            new_reminder = Reminder(
+                customer_id=r.customer_id,
+                custom_name=r.custom_name,
+                reason=r.reason,
+                frequency=r.frequency,
+                next_date=next_date,
+                note=f"Created after skip",
+                status="scheduled",
+            )
+            db.add(new_reminder)
+            db.commit()
+            db.refresh(new_reminder)
+            
+            return {
+                "id": r.id,
+                "status": r.status,
+                "next_date": r.next_date.isoformat() if r.next_date else None,
+                "next_reminder_id": new_reminder.id,
+                "next_reminder_date": new_reminder.next_date.isoformat(),
+                "message": f"Reminder skipped and next occurrence created for {new_reminder.next_date.strftime('%Y-%m-%d')}"
+            }
         else:
+            # For other statuses or one-time reminders, just update status
             r.status = status
+            
+            if status == "skipped":
+                r.note = f"Skipped on {datetime.now().strftime('%Y-%m-%d')}"
+            
+            db.commit()
+            db.refresh(r)
+            
+            return {
+                "id": r.id,
+                "status": r.status,
+                "next_date": r.next_date.isoformat() if r.next_date else None,
+                "message": f"Reminder status updated to {r.status}"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating reminder status: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to update status: {str(e)}")
+
+
+@router.post("/{reminder_id}/done")
+def mark_reminder_done(reminder_id: int, db: Session = Depends(get_db)):
+    """
+    ⭐ Mark reminder as DONE (skipped/cancelled)
+    
+    This is for when you want to skip this reminder without making a sale.
+    The reminder will be marked as "skipped" and won't show up anymore.
+    """
+    try:
+        r = db.query(Reminder).filter(Reminder.id == reminder_id).first()
+        if not r:
+            raise HTTPException(404, "Reminder not found")
+
+        # Mark as skipped
+        r.status = "skipped"
+        
+        # Replace note
+        r.note = "Marked as done"
         
         db.commit()
         db.refresh(r)
         
         return {
-            "id": r.id,
-            "status": r.status,
-            "next_date": r.next_date.isoformat() if r.next_date else None,
-            "message": f"Reminder status updated to {r.status}"
+            "message": "Reminder marked as done (skipped)",
+            "reminder_id": r.id,
+            "status": r.status
         }
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error updating reminder status: {str(e)}")
-        raise HTTPException(500, f"Failed to update status: {str(e)}")
+        print(f"Error marking reminder as done: {str(e)}")
+        raise HTTPException(500, f"Failed to mark as done: {str(e)}")
 
 
 @router.post("/{reminder_id}/complete")
 def complete_reminder(reminder_id: int, db: Session = Depends(get_db)):
-    """Mark reminder as completed and auto-create next one if recurring"""
+    """
+    ⭐ Mark reminder as COMPLETED and create next reminder
+    
+    This should be called automatically when a sale is made.
+    It marks the current reminder as completed and creates the next one based on frequency.
+    
+    Note: This is called automatically by the sale creation endpoint.
+    """
     try:
         r = db.query(Reminder).filter(Reminder.id == reminder_id).first()
         if not r:
@@ -326,14 +421,18 @@ def complete_reminder(reminder_id: int, db: Session = Depends(get_db)):
         db.refresh(r)
 
         # If recurring (frequency > 0), create next reminder
-        if r.frequency and r.frequency > 0:
+        # Convert frequency to int to avoid type comparison errors
+        freq = int(r.frequency) if r.frequency else 0
+        if freq > 0:
+            next_date = datetime.now() + timedelta(days=freq)
+            
             next_reminder = Reminder(
                 customer_id=r.customer_id,
                 custom_name=r.custom_name,
                 reason=r.reason,
                 frequency=r.frequency,
-                next_date=r.next_date + timedelta(days=r.frequency),
-                note=r.note,
+                next_date=next_date,
+                note=f"Auto-created after sale on {datetime.now().strftime('%Y-%m-%d')}",
                 status="scheduled",
             )
             db.add(next_reminder)
@@ -402,7 +501,7 @@ def advance_next_date(reminder_id: int, db: Session = Depends(get_db)):
     if not r:
         raise HTTPException(404, "Reminder not found")
 
-    freq = r.frequency or 0
+    freq = int(r.frequency) if r.frequency else 0
     if freq == 0:
         raise HTTPException(400, "Cannot advance a one-time reminder (frequency = 0).")
 
@@ -453,36 +552,78 @@ def generate_smart_reminders_endpoint(
     return result
 
 
-@router.post("/auto-advance-overdue")
-def auto_advance_overdue_reminders_endpoint(
-    days_overdue: int = 1,
-    db: Session = Depends(get_db)
-):
+@router.post("/advance-overdue")
+def advance_overdue_reminders_manual(db: Session = Depends(get_db)):
     """
-    Auto-advance overdue reminders - ONLY for ACTIVE DELIVERY customers
+    ⭐ MANUAL: Advance all overdue reminders to TODAY
+    
+    This moves ALL yesterday's and older overdue reminders to today (same time).
+    Use this button when you want to manually advance overdue reminders.
     
     Behavior:
-    - Yesterday's reminders → Moved to TODAY
-    - Older reminders → Skip cycles to next occurrence
-    - Only affects customers with:
-      - activity_status = "active"
-      - delivery_type = "delivery" (not self-pickup)
+    - All overdue reminders (yesterday and older) → Move to TODAY
+    - Status changed to "pending"
+    - Only affects pending/scheduled reminders
     
-    Parameters:
-    - days_overdue: How many days overdue before advancing (default: 1)
-    
-    This is useful for:
-    - Daily cleanup of overdue reminders
-    - Moving yesterday's missed deliveries to today
-    - Automatically rescheduling for active delivery customers only
+    Note: This does NOT skip cycles, just moves them to today.
     """
-    from services.smart_reminder_service import auto_advance_overdue_reminders
-    result = auto_advance_overdue_reminders(db, days_overdue)
+    now = datetime.now()
+    today = now.date()
+    
+    print(f"🔍 ADVANCE OVERDUE: Today is {today}")
+    
+    # Find all overdue reminders (before today)
+    overdue_reminders = (
+        db.query(Reminder)
+        .filter(
+            func.date(Reminder.next_date) < today,
+            Reminder.status.in_(["pending", "scheduled"])
+        )
+        .all()
+    )
+    
+    print(f"   Found {len(overdue_reminders)} overdue reminders")
+    
+    if not overdue_reminders:
+        return {
+            "message": "No overdue reminders found",
+            "advanced": 0
+        }
+    
+    advanced_count = 0
+    
+    for reminder in overdue_reminders:
+        old_date = reminder.next_date
+        
+        # Move to today (same time as original)
+        original_time = reminder.next_date.time()
+        reminder.next_date = datetime.combine(today, original_time)
+        
+        # Preserve timezone if original had one
+        if old_date.tzinfo is not None:
+            reminder.next_date = reminder.next_date.replace(tzinfo=old_date.tzinfo)
+        
+        reminder.status = "pending"
+        
+        print(f"   Reminder {reminder.id}: {old_date} → {reminder.next_date}")
+        
+        # Replace note instead of appending
+        reminder.note = f"Advanced to today"
+        
+        db.add(reminder)
+        advanced_count += 1
+    
+    db.commit()
+    
+    print(f"   ✅ Advanced {advanced_count} reminders to today")
+    
     return {
-        "total_advanced": result["total_advanced"],
-        "moved_to_today": result["moved_to_today"],
-        "skipped_cycles": result["skipped_cycles"],
-        "message": f"Advanced {result['total_advanced']} reminders: {result['moved_to_today']} moved to today, {result['skipped_cycles']} skipped cycles"
+        "message": f"Advanced {advanced_count} overdue reminder(s) to today",
+        "advanced": advanced_count
+    }
+    return {
+        "message": f"Advanced {advanced_count} overdue reminder(s) to today",
+        "advanced": advanced_count
     }
 
 

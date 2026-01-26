@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import Customer, Sale, Reminder
+from services.activity_service import detect_activity_status  # ⭐ Import the function
 
 
 def analyze_customer_pattern(customer_id: int, db: Session):

@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import date
 
 from dependencies import get_db
@@ -13,6 +13,123 @@ from services import recalc_jartracking
 from services.activity_service import update_customer_activity_status
 
 router = APIRouter(prefix="/sales", tags=["Sales"])
+
+
+# ⭐ SHARED FUNCTION: Apply payment using FIFO across linked accounts
+def apply_payment_fifo(
+    customer_id: int,
+    amount: float,
+    db: Session,
+    include_advance: bool = True
+) -> Tuple[float, str, int]:
+    """
+    Apply payment using FIFO across all linked accounts.
+    
+    Args:
+        customer_id: The customer making the payment
+        amount: The payment amount
+        db: Database session
+        include_advance: Whether to include existing advance in total available
+    
+    Returns:
+        Tuple of (final_advance, advance_message, settled_count)
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    print(f"🔍 APPLY PAYMENT FIFO: Customer {customer_id} ({customer.name}), Amount: ₹{amount}")
+    
+    # ⭐ Get existing advance from PARENT account (if linked) or current account
+    advance_customer = customer
+    if customer.parent_customer_id:
+        parent = db.query(Customer).filter(Customer.id == customer.parent_customer_id).first()
+        if parent:
+            advance_customer = parent
+            print(f"   Getting advance from PARENT account {parent.id} ({parent.name})")
+    
+    existing_advance = advance_customer.advance_payment or 0 if include_advance else 0
+    total_available = existing_advance + amount
+    
+    print(f"   Existing advance: ₹{existing_advance}, Total available: ₹{total_available}")
+    
+    # Determine all linked account IDs
+    account_ids = [customer_id]
+    
+    if customer.parent_customer_id:
+        # This is a child, get parent and all siblings
+        parent_id = customer.parent_customer_id
+        print(f"   This is a CHILD account, parent_id: {parent_id}")
+        account_ids = [parent_id]
+        children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
+        account_ids.extend([c.id for c in children])
+        print(f"   All linked account_ids: {account_ids}")
+    else:
+        # Check if this is a parent with children
+        children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
+        if children:
+            account_ids.extend([c.id for c in children])
+            print(f"   This is a PARENT account with {len(children)} children")
+            print(f"   All linked account_ids: {account_ids}")
+        else:
+            print(f"   This is a STANDALONE account")
+    
+    # Get ALL dues from all linked accounts (FIFO - oldest first)
+    all_dues = (
+        db.query(Sale)
+        .filter(Sale.customer_id.in_(account_ids), Sale.due_amount > 0)
+        .order_by(Sale.date.asc(), Sale.id.asc())  # FIFO - oldest first
+        .all()
+    )
+    
+    print(f"   Found {len(all_dues)} sales with dues across all linked accounts:")
+    for s in all_dues:
+        print(f"     - Sale {s.id}: customer_id={s.customer_id}, date={s.date}, due=₹{s.due_amount}")
+    
+    # Apply payment using FIFO
+    remaining_payment = total_available
+    settled_count = 0
+    
+    for due_sale in all_dues:
+        if remaining_payment <= 0:
+            break
+        
+        if remaining_payment >= due_sale.due_amount:
+            # Fully settle this sale
+            remaining_payment -= due_sale.due_amount
+            due_sale.amount_paid += due_sale.due_amount
+            due_sale.due_amount = 0
+            settled_count += 1
+            print(f"     ✅ Fully settled sale {due_sale.id}, remaining=₹{remaining_payment}")
+        else:
+            # Partially settle this sale
+            due_sale.amount_paid += remaining_payment
+            due_sale.due_amount -= remaining_payment
+            settled_count += 1
+            print(f"     ⚠️ Partially settled sale {due_sale.id}, new due=₹{due_sale.due_amount}")
+            remaining_payment = 0
+        
+        db.add(due_sale)
+    
+    # Calculate final advance
+    final_advance = max(0, remaining_payment)
+    
+    print(f"   Final advance: ₹{final_advance} (was ₹{existing_advance})")
+    
+    # Update advance in the appropriate account (parent if linked, self if standalone)
+    advance_customer.advance_payment = final_advance
+    db.add(advance_customer)
+    
+    # Generate advance payment message
+    advance_message = None
+    if existing_advance > 0 and final_advance < existing_advance:
+        advance_message = f"₹{existing_advance - final_advance:.2f} advance used. Remaining: ₹{final_advance:.2f}"
+    elif final_advance > existing_advance:
+        advance_message = f"₹{final_advance - existing_advance:.2f} added to advance. Total advance: ₹{final_advance:.2f}"
+    elif final_advance > 0 and existing_advance == 0:
+        advance_message = f"₹{final_advance:.2f} recorded as advance payment"
+    
+    return final_advance, advance_message, settled_count
 
 
 @router.post("")
@@ -72,70 +189,8 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
     our_jars = payload.total_jars - payload.customer_own_jars
     total_cost = payload.total_jars * cost_per_jar
     
-    # ⭐ PROPER ADVANCE + PAYMENT LOGIC
-    advance_payment_message = None
-    
-    # Calculate total payment needed (old dues + current sale)
-    total_payment_needed = total_cost
-    
-    if customer_id:
-        # Get all old dues (FIFO - oldest first)
-        old_dues = (
-            db.query(Sale)
-            .filter(Sale.customer_id == customer_id, Sale.due_amount > 0)
-            .order_by(Sale.date.asc())
-            .all()
-        )
-        
-        total_old_dues = sum(s.due_amount for s in old_dues)
-        total_payment_needed += total_old_dues
-        
-        # Total available = advance + actual payment
-        existing_advance = customer.advance_payment if customer else 0
-        total_available = existing_advance + payload.amount_paid
-        
-        # Settle old dues first (FIFO)
-        remaining_payment = total_available
-        for old_sale in old_dues:
-            if remaining_payment <= 0:
-                break
-            
-            if remaining_payment >= old_sale.due_amount:
-                remaining_payment -= old_sale.due_amount
-                old_sale.amount_paid += old_sale.due_amount
-                old_sale.due_amount = 0
-            else:
-                old_sale.amount_paid += remaining_payment
-                old_sale.due_amount -= remaining_payment
-                remaining_payment = 0
-            
-            db.add(old_sale)
-        
-        # After settling old dues, use remaining for current sale
-        amount_paid_for_current = min(remaining_payment, total_cost)
-        due_amount = total_cost - amount_paid_for_current
-        
-        # Calculate final advance
-        final_advance = max(0, remaining_payment - total_cost)
-        
-        # Update customer advance and show message
-        if customer:
-            advance_change = final_advance - existing_advance
-            customer.advance_payment = final_advance
-            
-            if existing_advance > 0 and final_advance < existing_advance:
-                advance_payment_message = f"₹{existing_advance - final_advance:.2f} advance used. Remaining: ₹{final_advance:.2f}"
-            elif final_advance > existing_advance:
-                advance_payment_message = f"₹{advance_change:.2f} added to advance. Total advance: ₹{final_advance:.2f}"
-            elif final_advance > 0 and existing_advance == 0:
-                advance_payment_message = f"₹{final_advance:.2f} recorded as advance payment"
-            
-            db.add(customer)
-    else:
-        # Walk-in customer - no advance payment
-        amount_paid_for_current = payload.amount_paid
-        due_amount = max(0, total_cost - amount_paid_for_current)
-
+    # ⭐ NEW LOGIC: Create sale first with full due amount, then apply payment via FIFO
+    # Step 1: Create the sale with full due amount (not paid yet)
     sale = Sale(
         customer_id=customer_id,
         customer_name=customer_name,
@@ -144,22 +199,56 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
         our_jars=our_jars,
         cost_per_jar=cost_per_jar,
         total_cost=total_cost,
-        amount_paid=amount_paid_for_current,
-        due_amount=due_amount,
+        amount_paid=0,  # Start with 0, will be updated by FIFO
+        due_amount=total_cost,  # Full amount is due initially
         date=payload.sale_date or None,
     )
     db.add(sale)
     db.commit()
     db.refresh(sale)
-
-    if payload.amount_paid > 0:
+    
+    # Step 2: Apply payment using FIFO across all linked accounts (if any payment was made)
+    advance_payment_message = None
+    
+    if payload.amount_paid > 0 and customer_id:
+        # Use shared FIFO payment function
+        final_advance, advance_payment_message, settled_count = apply_payment_fifo(
+            customer_id=customer_id,
+            amount=payload.amount_paid,
+            db=db,
+            include_advance=True
+        )
+        
+        # Record payment in payment_history
         payment = PaymentHistory(
-            customer_id=sale.customer_id,
-            customer_name=sale.customer_name,
+            customer_id=customer_id,
+            customer_name=customer_name,
+            amount_paid=payload.amount_paid
+        )
+        db.add(payment)
+        
+        db.commit()
+        db.refresh(sale)  # Refresh to get updated amount_paid and due_amount
+    elif payload.amount_paid > 0:
+        # Walk-in customer - simple payment (no linked accounts, no advance)
+        if payload.amount_paid >= total_cost:
+            sale.amount_paid = total_cost
+            sale.due_amount = 0
+        else:
+            sale.amount_paid = payload.amount_paid
+            sale.due_amount = total_cost - payload.amount_paid
+        
+        db.add(sale)
+        
+        # Record payment
+        payment = PaymentHistory(
+            customer_id=None,
+            customer_name=customer_name,
             amount_paid=payload.amount_paid
         )
         db.add(payment)
         db.commit()
+        db.refresh(sale)
 
     if our_jars > 0:
         jt = None
@@ -281,37 +370,61 @@ def pay_due(
     if not customer_id and not customer_name:
         raise HTTPException(status_code=400, detail="Customer ID or name required.")
 
-    # Get customer if profiled
-    customer = None
-    account_ids = []
-    
+    # Handle profiled customers
     if customer_id:
         customer = db.query(Customer).filter(Customer.id == customer_id).first()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         
-        # Determine all account IDs to include (for linked accounts)
-        account_ids = [customer_id]
+        # Use shared FIFO payment function
+        final_advance, advance_message, settled_count = apply_payment_fifo(
+            customer_id=customer_id,
+            amount=amount,
+            db=db,
+            include_advance=False  # Don't include existing advance for "Pay Due" button
+        )
         
+        # Create payment record
+        payment_record = PaymentHistory(
+            customer_id=customer_id,
+            customer_name=customer_name,
+            amount_paid=amount,
+        )
+        db.add(payment_record)
+        db.commit()
+        
+        # Calculate total remaining due across all linked accounts
+        account_ids = [customer_id]
         if customer.parent_customer_id:
-            # This is a child, get parent and all siblings
             parent_id = customer.parent_customer_id
             account_ids = [parent_id]
             children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
             account_ids.extend([c.id for c in children])
         else:
-            # Check if this is a parent with children
             children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
             if children:
                 account_ids.extend([c.id for c in children])
         
-        # Get all due sales from all linked accounts
-        due_sales = (
-            db.query(Sale)
-            .filter(Sale.customer_id.in_(account_ids), Sale.due_amount > 0)
-            .order_by(Sale.date.asc())  # FIFO - oldest first across all accounts
-            .all()
-        )
+        total_due = (
+            db.query(func.sum(Sale.due_amount))
+            .filter(Sale.customer_id.in_(account_ids))
+            .scalar()
+        ) or 0.0
+        
+        response = {
+            "message": "Due payment recorded successfully.",
+            "paid_amount": amount,
+            "total_due_now": total_due,
+            "settled_accounts": len(set([s.customer_id for s in db.query(Sale.customer_id).filter(Sale.customer_id.in_(account_ids)).distinct()]))
+        }
+        
+        if advance_message:
+            response["advance_payment_message"] = advance_message
+            response["advance_payment"] = final_advance
+        
+        return response
+    
+    # Handle walk-in customers
     else:
         due_sales = (
             db.query(Sale)
@@ -320,106 +433,46 @@ def pay_due(
             .all()
         )
 
-    if not due_sales:
-        # No dues, treat as advance payment
-        if customer:
-            customer.advance_payment = (customer.advance_payment or 0.0) + amount
-            db.add(customer)
-            
-            payment_record = PaymentHistory(
-                customer_id=customer_id,
-                customer_name=customer_name,
-                amount_paid=amount,
-            )
-            db.add(payment_record)
-            db.commit()
-            
-            return {
-                "message": "No dues found. Amount recorded as advance payment.",
-                "paid_amount": amount,
-                "advance_payment": customer.advance_payment,
-                "total_due_now": 0
-            }
-        else:
+        if not due_sales:
             raise HTTPException(status_code=404, detail="No due sales found for this customer.")
 
-    remaining = amount
-    settled_accounts = set()  # Track which accounts had dues settled
-    
-    for sale in due_sales:
-        if remaining <= 0:
-            break
+        remaining = amount
+        
+        for sale in due_sales:
+            if remaining <= 0:
+                break
 
-        if remaining >= sale.due_amount:
-            remaining -= sale.due_amount
-            sale.amount_paid += sale.due_amount
-            sale.due_amount = 0
-        else:
-            sale.amount_paid += remaining
-            sale.due_amount -= remaining
-            remaining = 0
+            if remaining >= sale.due_amount:
+                remaining -= sale.due_amount
+                sale.amount_paid += sale.due_amount
+                sale.due_amount = 0
+            else:
+                sale.amount_paid += remaining
+                sale.due_amount -= remaining
+                remaining = 0
 
-        db.add(sale)
-        settled_accounts.add(sale.customer_id)
+            db.add(sale)
 
-    # If there's remaining amount after settling all dues, record as advance
-    advance_message = None
-    if remaining > 0 and customer:
-        customer.advance_payment = (customer.advance_payment or 0.0) + remaining
-        db.add(customer)
-        advance_message = f"₹{remaining:.2f} recorded as advance payment"
-
-    # Create payment records for all accounts that had dues settled
-    if customer_id and len(account_ids) > 1:
-        # For linked accounts, create payment record for the account being paid through
         payment_record = PaymentHistory(
-            customer_id=customer_id,
+            customer_id=None,
             customer_name=customer_name,
             amount_paid=amount,
         )
         db.add(payment_record)
-    else:
-        payment_record = PaymentHistory(
-            customer_id=customer_id,
-            customer_name=customer_name,
-            amount_paid=amount,
-        )
-        db.add(payment_record)
+        db.commit()
 
-    db.commit()
-
-    # Calculate total remaining due across all linked accounts
-    if customer_id and len(account_ids) > 1:
-        total_due = (
-            db.query(func.sum(Sale.due_amount))
-            .filter(Sale.customer_id.in_(account_ids))
-            .scalar()
-        ) or 0.0
-    elif customer_id:
-        total_due = (
-            db.query(func.sum(Sale.due_amount))
-            .filter(Sale.customer_id == customer_id)
-            .scalar()
-        ) or 0.0
-    else:
         total_due = (
             db.query(func.sum(Sale.due_amount))
             .filter(Sale.customer_name == customer_name)
             .scalar()
         ) or 0.0
 
-    response = {
-        "message": "Due payment recorded successfully.",
-        "paid_amount": amount - remaining,
-        "total_due_now": total_due,
-        "settled_accounts": len(settled_accounts) if customer_id else 1
-    }
-    
-    if advance_message:
-        response["advance_payment_message"] = advance_message
-        response["advance_payment"] = customer.advance_payment if customer else 0
-    
-    return response
+        return {
+            "message": "Due payment recorded successfully.",
+            "paid_amount": amount,
+            "total_due_now": total_due,
+            "settled_accounts": 1
+        }
 
 
 @router.post("/total-due")
