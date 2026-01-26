@@ -2,13 +2,24 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from dependencies import get_db
 from schemas import ReminderCreate, ReminderUpdate, ReminderOut
 from models import Reminder, Customer, Sale
 
 router = APIRouter(prefix="/reminders", tags=["Reminders"])
+
+# ⭐ IST Timezone Helper (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.now(IST)
+
+def get_ist_today():
+    """Get today's date in IST"""
+    return get_ist_now().date()
 
 
 @router.post("", response_model=ReminderOut)
@@ -111,8 +122,10 @@ def list_reminders(db: Session = Depends(get_db)):
 def get_today_reminders(db: Session = Depends(get_db)):
     """Get reminders due today (for bell icon) - matches reminders page 'Today' filter"""
     try:
-        # Get ALL pending/scheduled reminders and filter in Python (same as frontend does)
-        # This ensures consistency with the reminders page "Today" filter
+        # Get current date in IST
+        today_ist = get_ist_today()
+        
+        # Get ALL pending/scheduled reminders
         reminders = (
             db.query(Reminder)
             .filter(Reminder.status.in_(["pending", "scheduled"]))
@@ -123,17 +136,20 @@ def get_today_reminders(db: Session = Depends(get_db)):
         if not reminders:
             return []
         
-        # Filter for today (same logic as frontend ReminderTable)
-        from datetime import date
-        today = date.today()
-        
         result = []
         for r in reminders:
             try:
-                # Check if reminder is for today
+                # Check if reminder is for today (in IST)
                 if r.next_date:
-                    reminder_date = r.next_date.date() if hasattr(r.next_date, 'date') else r.next_date
-                    if reminder_date != today:
+                    # Convert to IST
+                    if r.next_date.tzinfo is not None:
+                        reminder_date_ist = r.next_date.astimezone(IST).date()
+                    else:
+                        # If no timezone, assume UTC and convert to IST
+                        reminder_utc = r.next_date.replace(tzinfo=timezone.utc)
+                        reminder_date_ist = reminder_utc.astimezone(IST).date()
+                    
+                    if reminder_date_ist != today_ist:
                         continue
                 else:
                     continue
@@ -165,10 +181,10 @@ def get_today_reminders(db: Session = Depends(get_db)):
                     "custom_name": r.custom_name,
                     "reason": r.reason or "delivery",
                     "frequency": r.frequency if r.frequency is not None else 0,
-                    "next_date": r.next_date.isoformat() if r.next_date else datetime.now().isoformat(),
+                    "next_date": r.next_date.isoformat() if r.next_date else get_ist_now().isoformat(),
                     "note": r.note or "",
                     "status": r.status or "pending",
-                    "created_at": r.created_at.isoformat() if r.created_at else datetime.now().isoformat(),
+                    "created_at": r.created_at.isoformat() if r.created_at else get_ist_now().isoformat(),
                     "last_sale_date": last_sale_date,
                     "activity_status": activity_status,
                 })
@@ -311,7 +327,7 @@ def update_reminder_status(
             r.status = "skipped"
             
             # Replace note instead of appending
-            r.note = f"Skipped on {datetime.now().strftime('%Y-%m-%d')}"
+            r.note = f"Skipped on {get_ist_now().strftime('%Y-%m-%d')}"
             
             db.add(r)
             db.commit()
@@ -346,7 +362,7 @@ def update_reminder_status(
             r.status = status
             
             if status == "skipped":
-                r.note = f"Skipped on {datetime.now().strftime('%Y-%m-%d')}"
+                r.note = f"Skipped on {get_ist_now().strftime('%Y-%m-%d')}"
             
             db.commit()
             db.refresh(r)
@@ -424,7 +440,7 @@ def complete_reminder(reminder_id: int, db: Session = Depends(get_db)):
         # Convert frequency to int to avoid type comparison errors
         freq = int(r.frequency) if r.frequency else 0
         if freq > 0:
-            next_date = datetime.now() + timedelta(days=freq)
+            next_date = get_ist_now() + timedelta(days=freq)
             
             next_reminder = Reminder(
                 customer_id=r.customer_id,
@@ -432,7 +448,7 @@ def complete_reminder(reminder_id: int, db: Session = Depends(get_db)):
                 reason=r.reason,
                 frequency=r.frequency,
                 next_date=next_date,
-                note=f"Auto-created after sale on {datetime.now().strftime('%Y-%m-%d')}",
+                note=f"Auto-created after sale on {get_ist_now().strftime('%Y-%m-%d')}",
                 status="scheduled",
             )
             db.add(next_reminder)
@@ -476,9 +492,9 @@ def move_reminder_to_tomorrow(reminder_id: int, db: Session = Depends(get_db)):
         
         # Update note
         if r.note:
-            r.note += f" | Moved to tomorrow on {datetime.now().strftime('%Y-%m-%d')}"
+            r.note += f" | Moved to tomorrow on {get_ist_now().strftime('%Y-%m-%d')}"
         else:
-            r.note = f"Moved to tomorrow on {datetime.now().strftime('%Y-%m-%d')}"
+            r.note = f"Moved to tomorrow on {get_ist_now().strftime('%Y-%m-%d')}"
         
         db.commit()
         db.refresh(r)
@@ -515,7 +531,7 @@ def advance_next_date(reminder_id: int, db: Session = Depends(get_db)):
 @router.delete("/cleanup")
 def cleanup_old_reminders(db: Session = Depends(get_db)):
     """Only delete completed/cancelled reminders older than 30 days"""
-    month_ago = datetime.now() - timedelta(days=30)
+    month_ago = get_ist_now() - timedelta(days=30)
     removed = (
         db.query(Reminder)
         .filter(Reminder.next_date < month_ago)
@@ -567,24 +583,36 @@ def advance_overdue_reminders_manual(db: Session = Depends(get_db)):
     
     Note: This does NOT skip cycles, just moves them to today.
     """
-    now = datetime.now()
-    today = now.date()
+    now_ist = get_ist_now()
+    today_ist = get_ist_today()
     
-    print(f"🔍 ADVANCE OVERDUE: Today is {today}")
+    print(f"🔍 ADVANCE OVERDUE: Today is {today_ist} (IST)")
     
-    # Find all overdue reminders (before today)
+    # Find all overdue reminders (before today in IST)
     overdue_reminders = (
         db.query(Reminder)
         .filter(
-            func.date(Reminder.next_date) < today,
             Reminder.status.in_(["pending", "scheduled"])
         )
         .all()
     )
     
-    print(f"   Found {len(overdue_reminders)} overdue reminders")
+    # Filter in Python to handle timezone conversion to IST
+    actual_overdue = []
+    for r in overdue_reminders:
+        if r.next_date:
+            if r.next_date.tzinfo is not None:
+                reminder_date_ist = r.next_date.astimezone(IST).date()
+            else:
+                reminder_utc = r.next_date.replace(tzinfo=timezone.utc)
+                reminder_date_ist = reminder_utc.astimezone(IST).date()
+            
+            if reminder_date_ist < today_ist:
+                actual_overdue.append(r)
     
-    if not overdue_reminders:
+    print(f"   Found {len(actual_overdue)} overdue reminders")
+    
+    if not actual_overdue:
         return {
             "message": "No overdue reminders found",
             "advanced": 0
@@ -592,16 +620,18 @@ def advance_overdue_reminders_manual(db: Session = Depends(get_db)):
     
     advanced_count = 0
     
-    for reminder in overdue_reminders:
+    for reminder in actual_overdue:
         old_date = reminder.next_date
         
-        # Move to today (same time as original)
-        original_time = reminder.next_date.time()
-        reminder.next_date = datetime.combine(today, original_time)
-        
-        # Preserve timezone if original had one
+        # Move to today in IST (same time as original)
         if old_date.tzinfo is not None:
-            reminder.next_date = reminder.next_date.replace(tzinfo=old_date.tzinfo)
+            old_time_ist = old_date.astimezone(IST).time()
+        else:
+            old_time_ist = old_date.time()
+        
+        # Create new datetime in IST
+        new_datetime_ist = datetime.combine(today_ist, old_time_ist)
+        reminder.next_date = new_datetime_ist.replace(tzinfo=IST)
         
         reminder.status = "pending"
         

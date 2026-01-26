@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from dependencies import get_db
 from schemas import CustomerCreate, CustomerUpdate, ConvertWalkIn
@@ -10,6 +10,13 @@ from models import Customer, Sale, JarTracking, Reminder, PaymentHistory
 from services.activity_service import update_customer_activity_status, update_all_customers_activity_status, mark_customer_inactive
 
 router = APIRouter(prefix="/customers", tags=["Customers"])
+
+# ⭐ IST Timezone Helper (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.now(IST)
 
 
 @router.post("")
@@ -32,13 +39,13 @@ def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)):
     # create default reminder when customer has delivery type
     if customer.delivery_type == "delivery":
         try:
-            now = datetime.now()
+            now_ist = get_ist_now()
             default_reminder = Reminder(
                 customer_id=customer.id,
                 custom_name=None,
                 reason="delivery",
                 frequency=3,
-                next_date=now,
+                next_date=now_ist,
                 note="Auto-created on profile creation (delivery).",
                 status="pending"
             )

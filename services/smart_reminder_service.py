@@ -1,9 +1,16 @@
 # backend/services/smart_reminder_service.py
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import Customer, Sale, Reminder
 from services.activity_service import detect_activity_status  # ⭐ Import the function
+
+# ⭐ IST Timezone Helper (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.now(IST)
 
 
 def analyze_customer_pattern(customer_id: int, db: Session):
@@ -82,20 +89,18 @@ def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
             no_pattern += 1
             continue
 
-        # Calculate days since last purchase
-        # Handle both timezone-aware and naive datetimes
-        now = datetime.now()
+        # Calculate days since last purchase (using IST)
+        now_ist = get_ist_now()
         sale_date = last_sale.date
         
-        # If sale_date is timezone-aware, make now timezone-aware too
+        # Convert sale_date to IST for comparison
         if sale_date.tzinfo is not None:
-            from datetime import timezone
-            now = datetime.now(timezone.utc)
-            # Convert to same timezone as sale_date
-            if sale_date.tzinfo != timezone.utc:
-                sale_date = sale_date.astimezone(timezone.utc)
+            sale_date_ist = sale_date.astimezone(IST)
+        else:
+            # Assume UTC if no timezone
+            sale_date_ist = sale_date.replace(tzinfo=timezone.utc).astimezone(IST)
         
-        days_since_last = (now - sale_date).days
+        days_since_last = (now_ist - sale_date_ist).days
 
         # ⭐ NEW: Skip if customer inactive for too long (default: 60 days)
         if days_since_last > max_inactive_days:
@@ -114,18 +119,11 @@ def generate_smart_reminders(db: Session, max_inactive_days: int = 60):
         max_overdue = avg_days * 2
         
         if days_since_last >= (avg_days - 1) and days_since_last <= max_overdue:
-            # Calculate expected next delivery date
-            # Use timezone-aware datetime if sale_date is timezone-aware
-            if sale_date.tzinfo is not None:
-                expected_date = sale_date + timedelta(days=avg_days)
-                # If expected date is in the past, use now
-                if expected_date < now:
-                    expected_date = now
-            else:
-                expected_date = last_sale.date + timedelta(days=avg_days)
-                # If expected date is in the past, use today
-                if expected_date < datetime.now():
-                    expected_date = datetime.now()
+            # Calculate expected next delivery date in IST
+            expected_date = sale_date_ist + timedelta(days=avg_days)
+            # If expected date is in the past, use now
+            if expected_date < now_ist:
+                expected_date = now_ist
             
             reminder = Reminder(
                 customer_id=customer.id,
@@ -164,8 +162,6 @@ def update_customer_reminder_after_sale(customer_id: int, db: Session):
     - Activity status is recalculated based on new purchase
     - Only creates reminders for ACTIVE DELIVERY customers
     """
-    from datetime import timezone
-    
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         return
@@ -196,51 +192,16 @@ def update_customer_reminder_after_sale(customer_id: int, db: Session):
     # Analyze pattern and create new reminder
     avg_days = analyze_customer_pattern(customer_id, db)
     if avg_days and avg_days > 0:
-        # Check if we need timezone-aware datetime
-        # Look at existing reminders to determine timezone usage
-        sample_reminder = db.query(Reminder).first()
-        if sample_reminder and sample_reminder.next_date and sample_reminder.next_date.tzinfo is not None:
-            # Use timezone-aware datetime
-            now = datetime.now(timezone.utc)
-        else:
-            # Use naive datetime
-            now = datetime.now()
+        # Use IST for new reminder
+        now_ist = get_ist_now()
+        next_date = now_ist + timedelta(days=avg_days)
         
-        # Calculate from TODAY (actual purchase date), not old reminder date
-        next_date = now + timedelta(days=avg_days)
         new_reminder = Reminder(
             customer_id=customer_id,
             reason="delivery",
             frequency=avg_days,
             next_date=next_date,
-            note=f"Auto-created after sale: Next delivery expected in {avg_days} days (from {now.strftime('%Y-%m-%d')})",
-            status="scheduled",
-        )
-        db.add(new_reminder)
-
-    db.commit()
-
-    # Analyze pattern and create new reminder
-    avg_days = analyze_customer_pattern(customer_id, db)
-    if avg_days and avg_days > 0:
-        # Check if we need timezone-aware datetime
-        # Look at existing reminders to determine timezone usage
-        sample_reminder = db.query(Reminder).first()
-        if sample_reminder and sample_reminder.next_date and sample_reminder.next_date.tzinfo is not None:
-            # Use timezone-aware datetime
-            now = datetime.now(timezone.utc)
-        else:
-            # Use naive datetime
-            now = datetime.now()
-        
-        # ⭐ FIXED: Calculate from TODAY (actual purchase date), not old reminder date
-        next_date = now + timedelta(days=avg_days)
-        new_reminder = Reminder(
-            customer_id=customer_id,
-            reason="delivery",
-            frequency=avg_days,
-            next_date=next_date,
-            note=f"Auto-created after sale: Next delivery expected in {avg_days} days (from {now.strftime('%Y-%m-%d')})",
+            note=f"Auto-created after sale on {now_ist.strftime('%Y-%m-%d')}",
             status="scheduled",
         )
         db.add(new_reminder)
@@ -261,12 +222,10 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     Returns:
         Number of reminders advanced
     """
-    from datetime import timezone
-    
-    now = datetime.now()
-    today = now.date()
-    yesterday = today - timedelta(days=1)
-    cutoff_date = now - timedelta(days=days_overdue)
+    now_ist = get_ist_now()
+    today_ist = now_ist.date()
+    yesterday_ist = today_ist - timedelta(days=1)
+    cutoff_date_ist = now_ist - timedelta(days=days_overdue)
     
     # Find overdue reminders with frequency > 0, ONLY for ACTIVE DELIVERY customers
     overdue_reminders = (
@@ -286,33 +245,29 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
     moved_to_today = 0
     
     for reminder in overdue_reminders:
-        # Handle timezone-aware dates
+        # Convert to IST for comparison
         next_date = reminder.next_date
         if next_date.tzinfo is not None:
-            now_aware = datetime.now(timezone.utc)
-            if next_date.tzinfo != timezone.utc:
-                next_date = next_date.astimezone(timezone.utc)
-            days_overdue_count = (now_aware - next_date).days
-            reminder_date = next_date.date()
+            next_date_ist = next_date.astimezone(IST)
         else:
-            days_overdue_count = (now - next_date).days
-            reminder_date = next_date.date()
+            next_date_ist = next_date.replace(tzinfo=timezone.utc).astimezone(IST)
+        
+        days_overdue_count = (now_ist - next_date_ist).days
+        reminder_date_ist = next_date_ist.date()
         
         # ⭐ NEW: If reminder was yesterday, just move to today
-        if reminder_date == yesterday:
-            # Move to today (same time)
-            if next_date.tzinfo is not None:
-                reminder.next_date = datetime.combine(today, next_date.time()).replace(tzinfo=next_date.tzinfo)
-            else:
-                reminder.next_date = datetime.combine(today, next_date.time())
+        if reminder_date_ist == yesterday_ist:
+            # Move to today in IST (same time)
+            new_datetime_ist = datetime.combine(today_ist, next_date_ist.time())
+            reminder.next_date = new_datetime_ist.replace(tzinfo=IST)
             
             reminder.status = "pending"
             
             # Update note
             if reminder.note:
-                reminder.note += f" | Moved from yesterday to today on {now.strftime('%Y-%m-%d')}"
+                reminder.note += f" | Moved from yesterday to today on {now_ist.strftime('%Y-%m-%d')}"
             else:
-                reminder.note = f"Moved from yesterday to today on {now.strftime('%Y-%m-%d')}"
+                reminder.note = f"Moved from yesterday to today on {now_ist.strftime('%Y-%m-%d')}"
             
             moved_to_today += 1
         else:
@@ -320,14 +275,14 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
             cycles_to_skip = (days_overdue_count // reminder.frequency) + 1
             
             # Advance to next occurrence
-            reminder.next_date = reminder.next_date + timedelta(days=reminder.frequency * cycles_to_skip)
+            reminder.next_date = next_date_ist + timedelta(days=reminder.frequency * cycles_to_skip)
             reminder.status = "scheduled"
             
             # Update note
             if reminder.note:
-                reminder.note += f" | Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
+                reminder.note += f" | Auto-advanced {cycles_to_skip} cycle(s) on {now_ist.strftime('%Y-%m-%d')}"
             else:
-                reminder.note = f"Auto-advanced {cycles_to_skip} cycle(s) on {now.strftime('%Y-%m-%d')}"
+                reminder.note = f"Auto-advanced {cycles_to_skip} cycle(s) on {now_ist.strftime('%Y-%m-%d')}"
         
         advanced += 1
     

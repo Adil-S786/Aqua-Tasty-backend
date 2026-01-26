@@ -3,13 +3,20 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from dependencies import get_db
 from models import PaymentHistory, Customer, Sale
 from routers.sales import apply_payment_fifo  # ⭐ Import shared function
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
+
+# ⭐ IST Timezone Helper (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.now(IST)
 
 
 @router.get("")
@@ -60,14 +67,14 @@ def create_backdated_payment(
     if not customer_id and not customer_name:
         raise HTTPException(status_code=400, detail="Customer ID or name required")
     
-    # Parse payment date or use current time
+    # Parse payment date or use current time in IST
     if payment_date:
         try:
             parsed_date = datetime.fromisoformat(payment_date.replace('Z', '+00:00'))
         except:
             raise HTTPException(status_code=400, detail="Invalid date format")
     else:
-        parsed_date = datetime.now()
+        parsed_date = get_ist_now()
     
     # Get customer if profiled
     customer = None
