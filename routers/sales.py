@@ -207,28 +207,42 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(sale)
     
-    # Step 2: Apply payment using FIFO across all linked accounts (if any payment was made)
+    # Step 2: Apply payment using FIFO across all linked accounts
+    # ⭐ FIXED: Always check for advance, even if no new payment
     advance_payment_message = None
     
-    if payload.amount_paid > 0 and customer_id:
-        # Use shared FIFO payment function
-        final_advance, advance_payment_message, settled_count = apply_payment_fifo(
-            customer_id=customer_id,
-            amount=payload.amount_paid,
-            db=db,
-            include_advance=True
-        )
+    if customer_id:
+        # Check if there's existing advance to use (even if no new payment)
+        customer_for_advance = customer
+        if customer.parent_customer_id:
+            parent = db.query(Customer).filter(Customer.id == customer.parent_customer_id).first()
+            if parent:
+                customer_for_advance = parent
         
-        # Record payment in payment_history
-        payment = PaymentHistory(
-            customer_id=customer_id,
-            customer_name=customer_name,
-            amount_paid=payload.amount_paid
-        )
-        db.add(payment)
+        existing_advance = customer_for_advance.advance_payment or 0
+        new_payment = payload.amount_paid or 0
         
-        db.commit()
-        db.refresh(sale)  # Refresh to get updated amount_paid and due_amount
+        # If there's any money to apply (advance OR new payment)
+        if existing_advance > 0 or new_payment > 0:
+            # Use shared FIFO payment function
+            final_advance, advance_payment_message, settled_count = apply_payment_fifo(
+                customer_id=customer_id,
+                amount=new_payment,
+                db=db,
+                include_advance=True  # Always include advance
+            )
+            
+            # Record payment in payment_history only if new payment was made
+            if new_payment > 0:
+                payment = PaymentHistory(
+                    customer_id=customer_id,
+                    customer_name=customer_name,
+                    amount_paid=new_payment
+                )
+                db.add(payment)
+            
+            db.commit()
+            db.refresh(sale)  # Refresh to get updated amount_paid and due_amount
     elif payload.amount_paid > 0:
         # Walk-in customer - simple payment (no linked accounts, no advance)
         if payload.amount_paid >= total_cost:

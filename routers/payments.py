@@ -181,7 +181,14 @@ def create_backdated_payment(
 
 @router.delete("/{payment_id}")
 def delete_payment(payment_id: int, db: Session = Depends(get_db)):
-    """Delete a payment and REVERT its effect on Sale dues. Re-opens dues in reverse LIFO order (newest first)."""
+    """
+    Delete a payment and REVERT its effect.
+    
+    Logic:
+    1. First reduce advance from parent account (if linked) or current account
+    2. If advance goes negative, re-open dues in LIFO order (newest first)
+    3. For linked accounts, re-opens dues across ALL linked accounts
+    """
     payment = db.query(PaymentHistory).filter(PaymentHistory.id == payment_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -189,16 +196,98 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
     customer_id = payment.customer_id
     customer_name = payment.customer_name
     amount_to_revert = payment.amount_paid
+    
+    print(f"🗑️ DELETE PAYMENT: ID={payment_id}, Amount=₹{amount_to_revert}, Customer={customer_id or customer_name}")
 
-    # Get sales in LIFO order (newest first) for payment reversal
     if customer_id:
-        sales = (
-            db.query(Sale)
-            .filter(Sale.customer_id == customer_id)
-            .order_by(Sale.date.desc())  # LIFO - newest first
-            .all()
-        )
+        # Get customer and determine linked accounts
+        customer = db.query(Customer).filter(Customer.id == customer_id).first()
+        
+        # Find the account that holds advance (parent if linked)
+        advance_customer = customer
+        account_ids = [customer_id]
+        
+        if customer.parent_customer_id:
+            # This is a child, get parent
+            parent = db.query(Customer).filter(Customer.id == customer.parent_customer_id).first()
+            if parent:
+                advance_customer = parent
+                account_ids = [parent.id]
+                # Get all siblings
+                children = db.query(Customer).filter(Customer.parent_customer_id == parent.id).all()
+                account_ids.extend([c.id for c in children])
+        else:
+            # Check if this is a parent with children
+            children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
+            if children:
+                account_ids.extend([c.id for c in children])
+        
+        print(f"   Advance customer: {advance_customer.id} ({advance_customer.name})")
+        print(f"   All linked account_ids: {account_ids}")
+        
+        # Step 1: Reduce advance first
+        current_advance = advance_customer.advance_payment or 0
+        remaining_to_revert = amount_to_revert
+        
+        if current_advance > 0:
+            if current_advance >= remaining_to_revert:
+                # Advance covers the full revert
+                advance_customer.advance_payment = current_advance - remaining_to_revert
+                remaining_to_revert = 0
+                print(f"   Reduced advance by ₹{amount_to_revert}, new advance=₹{advance_customer.advance_payment}")
+            else:
+                # Use all advance, still need to revert more
+                remaining_to_revert -= current_advance
+                advance_customer.advance_payment = 0
+                print(f"   Used all advance (₹{current_advance}), still need to revert ₹{remaining_to_revert}")
+            
+            db.add(advance_customer)
+        
+        # Step 2: Re-open dues in LIFO order (newest first) across all linked accounts
+        if remaining_to_revert > 0:
+            sales = (
+                db.query(Sale)
+                .filter(Sale.customer_id.in_(account_ids))
+                .order_by(Sale.date.desc(), Sale.id.desc())  # LIFO - newest first
+                .all()
+            )
+            
+            print(f"   Found {len(sales)} sales to potentially re-open dues")
+            
+            for sale in sales:
+                if remaining_to_revert <= 0:
+                    break
+
+                reversible = sale.amount_paid
+
+                if reversible <= 0:
+                    continue
+
+                if remaining_to_revert >= reversible:
+                    sale.amount_paid = 0
+                    sale.due_amount += reversible
+                    remaining_to_revert -= reversible
+                    print(f"   Re-opened ₹{reversible} due on sale {sale.id}")
+                else:
+                    sale.amount_paid -= remaining_to_revert
+                    sale.due_amount += remaining_to_revert
+                    print(f"   Re-opened ₹{remaining_to_revert} due on sale {sale.id}")
+                    remaining_to_revert = 0
+
+                db.add(sale)
+        
+        db.delete(payment)
+        db.commit()
+        
+        return {
+            "message": "Payment deleted and dues restored successfully",
+            "reverted_amount": amount_to_revert,
+            "advance_reduced": min(current_advance, amount_to_revert),
+            "dues_reopened": amount_to_revert - min(current_advance, amount_to_revert)
+        }
+    
     else:
+        # Walk-in customer - simple reversal (no advance, no linked accounts)
         sales = (
             db.query(Sale)
             .filter(Sale.customer_name == customer_name)
@@ -206,33 +295,33 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
             .all()
         )
 
-    remaining = amount_to_revert
+        remaining = amount_to_revert
 
-    for sale in sales:
-        if remaining <= 0:
-            break
+        for sale in sales:
+            if remaining <= 0:
+                break
 
-        reversible = sale.amount_paid
+            reversible = sale.amount_paid
 
-        if reversible <= 0:
-            continue
+            if reversible <= 0:
+                continue
 
-        if remaining >= reversible:
-            sale.amount_paid -= reversible
-            sale.due_amount += reversible
-            remaining -= reversible
-        else:
-            sale.amount_paid -= remaining
-            sale.due_amount += remaining
-            remaining = 0
+            if remaining >= reversible:
+                sale.amount_paid = 0
+                sale.due_amount += reversible
+                remaining -= reversible
+            else:
+                sale.amount_paid -= remaining
+                sale.due_amount += remaining
+                remaining = 0
 
-        db.add(sale)
+            db.add(sale)
 
-    db.delete(payment)
-    db.commit()
+        db.delete(payment)
+        db.commit()
 
-    return {
-        "message": "Payment deleted and dues restored successfully",
-        "reverted_amount": amount_to_revert - remaining,
-        "unapplied_amount": remaining
-    }
+        return {
+            "message": "Payment deleted and dues restored successfully",
+            "reverted_amount": amount_to_revert - remaining,
+            "unapplied_amount": remaining
+        }
