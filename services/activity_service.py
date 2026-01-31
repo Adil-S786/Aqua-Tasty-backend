@@ -14,6 +14,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from models import Customer, Sale
 
+# ⭐ IST Timezone Helper (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    """Get current datetime in IST"""
+    return datetime.now(IST)
+
 
 def detect_activity_status(customer_id: int, db: Session) -> str:
     """
@@ -32,14 +39,17 @@ def detect_activity_status(customer_id: int, db: Session) -> str:
         return "no_pattern"
     
     sale_count = len(sales)
-    now = datetime.now(timezone.utc)
+    now_ist = get_ist_now()
     
-    # Get the most recent sale date
+    # Get the most recent sale date and convert to IST
     last_sale_date = sales[0].date
-    if last_sale_date.tzinfo is None:
-        last_sale_date = last_sale_date.replace(tzinfo=timezone.utc)
+    if last_sale_date.tzinfo is not None:
+        last_sale_date_ist = last_sale_date.astimezone(IST)
+    else:
+        # Assume UTC if no timezone
+        last_sale_date_ist = last_sale_date.replace(tzinfo=timezone.utc).astimezone(IST)
     
-    days_since_last_purchase = (now - last_sale_date).days
+    days_since_last_purchase = (now_ist - last_sale_date_ist).days
     
     # Rule 1: Only one purchase
     if sale_count == 1:
@@ -54,9 +64,9 @@ def detect_activity_status(customer_id: int, db: Session) -> str:
         # Calculate average days between purchases
         sale_dates = [s.date for s in sales]
         
-        # Ensure all dates are timezone-aware
+        # Ensure all dates are timezone-aware and convert to IST
         sale_dates = [
-            d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d
+            d.astimezone(IST) if d.tzinfo is not None else d.replace(tzinfo=timezone.utc).astimezone(IST)
             for d in sale_dates
         ]
         

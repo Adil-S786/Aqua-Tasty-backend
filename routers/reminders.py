@@ -203,14 +203,14 @@ def get_today_reminders(db: Session = Depends(get_db)):
 @router.get("/overdue")
 async def get_overdue_reminders(db: Session = Depends(get_db)):
     """Get all overdue reminders (past due date and still pending/scheduled)"""
-    from datetime import timezone
     
     try:
-        now = datetime.now(timezone.utc)
+        now_ist = get_ist_now()
+        today_ist = get_ist_today()
         
+        # Get all pending/scheduled reminders
         reminders = (
             db.query(Reminder)
-            .filter(Reminder.next_date < now)
             .filter(Reminder.status.in_(["pending", "scheduled"]))
             .order_by(Reminder.next_date.asc())
             .all()
@@ -219,8 +219,24 @@ async def get_overdue_reminders(db: Session = Depends(get_db)):
         if not reminders:
             return []
         
-        result = []
+        # Filter for overdue (before today in IST)
+        overdue_reminders = []
         for r in reminders:
+            if r.next_date:
+                if r.next_date.tzinfo is not None:
+                    reminder_date_ist = r.next_date.astimezone(IST).date()
+                else:
+                    reminder_utc = r.next_date.replace(tzinfo=timezone.utc)
+                    reminder_date_ist = reminder_utc.astimezone(IST).date()
+                
+                if reminder_date_ist < today_ist:
+                    overdue_reminders.append(r)
+        
+        if not overdue_reminders:
+            return []
+        
+        result = []
+        for r in overdue_reminders:
             try:
                 customer_name = None
                 last_sale_date = None

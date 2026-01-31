@@ -232,7 +232,7 @@ def auto_advance_overdue_reminders(db: Session, days_overdue: int = 1):
         db.query(Reminder)
         .join(Customer, Reminder.customer_id == Customer.id)
         .filter(
-            Reminder.next_date < cutoff_date,
+            Reminder.next_date < cutoff_date_ist,
             Reminder.status.in_(["pending", "scheduled"]),
             Reminder.frequency > 0,
             Customer.activity_status == "active",  # Only active customers
