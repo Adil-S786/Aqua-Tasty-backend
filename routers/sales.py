@@ -38,20 +38,15 @@ def apply_payment_fifo(
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     
-    print(f"🔍 APPLY PAYMENT FIFO: Customer {customer_id} ({customer.name}), Amount: ₹{amount}")
-    
-    # ⭐ Get existing advance from PARENT account (if linked) or current account
+    # Get existing advance from PARENT account (if linked) or current account
     advance_customer = customer
     if customer.parent_customer_id:
         parent = db.query(Customer).filter(Customer.id == customer.parent_customer_id).first()
         if parent:
             advance_customer = parent
-            print(f"   Getting advance from PARENT account {parent.id} ({parent.name})")
     
     existing_advance = advance_customer.advance_payment or 0 if include_advance else 0
     total_available = existing_advance + amount
-    
-    print(f"   Existing advance: ₹{existing_advance}, Total available: ₹{total_available}")
     
     # Determine all linked account IDs
     account_ids = [customer_id]
@@ -59,20 +54,14 @@ def apply_payment_fifo(
     if customer.parent_customer_id:
         # This is a child, get parent and all siblings
         parent_id = customer.parent_customer_id
-        print(f"   This is a CHILD account, parent_id: {parent_id}")
         account_ids = [parent_id]
         children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
         account_ids.extend([c.id for c in children])
-        print(f"   All linked account_ids: {account_ids}")
     else:
         # Check if this is a parent with children
         children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
         if children:
             account_ids.extend([c.id for c in children])
-            print(f"   This is a PARENT account with {len(children)} children")
-            print(f"   All linked account_ids: {account_ids}")
-        else:
-            print(f"   This is a STANDALONE account")
     
     # Get ALL dues from all linked accounts (FIFO - oldest first)
     all_dues = (
@@ -81,10 +70,6 @@ def apply_payment_fifo(
         .order_by(Sale.date.asc(), Sale.id.asc())  # FIFO - oldest first
         .all()
     )
-    
-    print(f"   Found {len(all_dues)} sales with dues across all linked accounts:")
-    for s in all_dues:
-        print(f"     - Sale {s.id}: customer_id={s.customer_id}, date={s.date}, due=₹{s.due_amount}")
     
     # Apply payment using FIFO
     remaining_payment = total_available
@@ -100,13 +85,11 @@ def apply_payment_fifo(
             due_sale.amount_paid += due_sale.due_amount
             due_sale.due_amount = 0
             settled_count += 1
-            print(f"     ✅ Fully settled sale {due_sale.id}, remaining=₹{remaining_payment}")
         else:
             # Partially settle this sale
             due_sale.amount_paid += remaining_payment
             due_sale.due_amount -= remaining_payment
             settled_count += 1
-            print(f"     ⚠️ Partially settled sale {due_sale.id}, new due=₹{due_sale.due_amount}")
             remaining_payment = 0
         
         db.add(due_sale)
@@ -114,11 +97,12 @@ def apply_payment_fifo(
     # Calculate final advance
     final_advance = max(0, remaining_payment)
     
-    print(f"   Final advance: ₹{final_advance} (was ₹{existing_advance})")
-    
     # Update advance in the appropriate account (parent if linked, self if standalone)
     advance_customer.advance_payment = final_advance
     db.add(advance_customer)
+    
+    # Commit all FIFO changes
+    db.commit()
     
     # Generate advance payment message
     advance_message = None
@@ -208,7 +192,6 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
     db.refresh(sale)
     
     # Step 2: Apply payment using FIFO across all linked accounts
-    # ⭐ FIXED: Always check for advance, even if no new payment
     advance_payment_message = None
     
     if customer_id:
@@ -232,6 +215,9 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
                 include_advance=True  # Always include advance
             )
             
+            # Refresh the sale to get updated values from FIFO
+            db.refresh(sale)
+            
             # Record payment in payment_history only if new payment was made
             if new_payment > 0:
                 payment = PaymentHistory(
@@ -240,6 +226,11 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
                     amount_paid=new_payment
                 )
                 db.add(payment)
+                db.flush()  # Get the payment ID
+                
+                # Link payment to sale
+                sale.payment_id = payment.id
+                db.add(sale)
             
             db.commit()
             db.refresh(sale)  # Refresh to get updated amount_paid and due_amount
@@ -252,8 +243,6 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
             sale.amount_paid = payload.amount_paid
             sale.due_amount = total_cost - payload.amount_paid
         
-        db.add(sale)
-        
         # Record payment
         payment = PaymentHistory(
             customer_id=None,
@@ -261,6 +250,11 @@ def create_sale(payload: SaleCreate, db: Session = Depends(get_db)):
             amount_paid=payload.amount_paid
         )
         db.add(payment)
+        db.flush()  # Get the payment ID
+        
+        # Link payment to sale
+        sale.payment_id = payment.id
+        db.add(sale)
         db.commit()
         db.refresh(sale)
 
@@ -505,29 +499,20 @@ def get_total_due(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         
-        print(f"DEBUG: Customer {customer_id} ({customer.name}), parent_customer_id: {customer.parent_customer_id}")
-        
         # Determine all account IDs to include
         account_ids = [customer_id]
         
         if customer.parent_customer_id:
             # This is a child, get parent and all siblings
             parent_id = customer.parent_customer_id
-            print(f"DEBUG: This is a child, parent_id: {parent_id}")
             account_ids = [parent_id]
             children = db.query(Customer).filter(Customer.parent_customer_id == parent_id).all()
             account_ids.extend([c.id for c in children])
-            print(f"DEBUG: Found {len(children)} children: {[c.id for c in children]}")
         else:
             # Check if this is a parent with children
             children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
             if children:
                 account_ids.extend([c.id for c in children])
-                print(f"DEBUG: This is a parent with {len(children)} children: {[c.id for c in children]}")
-            else:
-                print(f"DEBUG: This is a standalone account (no parent, no children)")
-        
-        print(f"DEBUG: Final account_ids to query: {account_ids}")
         
         # Get total due from all linked accounts
         total_due = (
@@ -535,18 +520,6 @@ def get_total_due(
             .filter(Sale.customer_id.in_(account_ids))
             .scalar()
         )
-        
-        # Get individual dues for debugging
-        for acc_id in account_ids:
-            individual_due = (
-                db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
-                .filter(Sale.customer_id == acc_id)
-                .scalar()
-            )
-            acc = db.query(Customer).filter(Customer.id == acc_id).first()
-            print(f"DEBUG: Account {acc_id} ({acc.name if acc else 'Unknown'}): ₹{individual_due}")
-        
-        print(f"DEBUG: Total due calculated: ₹{total_due}")
     else:
         total_due = (
             db.query(func.coalesce(func.sum(Sale.due_amount), 0.0))
@@ -554,7 +527,7 @@ def get_total_due(
             .scalar()
         )
 
-    return {"total_due": float(total_due), "account_ids": account_ids if customer_id else []}  # Return account_ids for debugging
+    return {"total_due": float(total_due), "account_ids": account_ids if customer_id else []}
 
 
 @router.delete("/{sale_id}")
@@ -578,9 +551,6 @@ def delete_sale(
     customer_id = sale.customer_id
     customer_name = sale.customer_name
     amount_paid = sale.amount_paid or 0
-    sale_date = sale.date
-    
-    print(f"🗑️ DELETE SALE: ID={sale_id}, Customer={customer_id or customer_name}, Amount Paid=₹{amount_paid}, Action={action}")
     
     response = {"message": "Sale deleted successfully.", "action_taken": action}
     
@@ -600,16 +570,10 @@ def delete_sale(
                     account_ids = [parent.id]
                     children = db.query(Customer).filter(Customer.parent_customer_id == parent.id).all()
                     account_ids.extend([c.id for c in children])
-                    print(f"   🔗 LINKED ACCOUNT (child): Parent={parent.id} ({parent.name}), All accounts={account_ids}")
             else:
                 children = db.query(Customer).filter(Customer.parent_customer_id == customer_id).all()
                 if children:
                     account_ids.extend([c.id for c in children])
-                    print(f"   🔗 LINKED ACCOUNT (parent): Children={[c.id for c in children]}, All accounts={account_ids}")
-                else:
-                    print(f"   📌 STANDALONE ACCOUNT: {customer_id}")
-            
-            print(f"   💰 Advance stored in: {advance_customer.id} ({advance_customer.name}), Current advance: ₹{advance_customer.advance_payment or 0}")
             
             if action == "advance":
                 # Restore the amount to advance
@@ -618,7 +582,6 @@ def delete_sale(
                 advance_customer.advance_payment = new_advance
                 db.add(advance_customer)
                 
-                print(f"   ✅ Restored ₹{amount_paid} to advance. New advance: ₹{new_advance}")
                 response["advance_restored"] = amount_paid
                 response["new_advance"] = new_advance
                 
@@ -661,51 +624,58 @@ def delete_sale(
                     advance_customer.advance_payment = current_advance + remaining
                     db.add(advance_customer)
                 
-                print(f"   ✅ Settled {settled_count} dues, ₹{remaining} to advance")
                 response["dues_settled"] = settled_count
                 response["amount_to_advance"] = remaining
                 
             elif action == "delete_payment":
-                # Find and delete the corresponding payment record
-                # Match by customer_id, amount, and approximate date
-                payment = (
-                    db.query(PaymentHistory)
-                    .filter(
-                        PaymentHistory.customer_id == customer_id,
-                        PaymentHistory.amount_paid == amount_paid
+                # Find the payment record using the linked payment_id
+                payment = None
+                if sale.payment_id:
+                    payment = db.query(PaymentHistory).filter(PaymentHistory.id == sale.payment_id).first()
+                
+                # Fallback: find most recent payment for this customer if no direct link
+                if not payment:
+                    payment = (
+                        db.query(PaymentHistory)
+                        .filter(PaymentHistory.customer_id == customer_id)
+                        .order_by(PaymentHistory.date.desc())
+                        .first()
                     )
-                    .order_by(PaymentHistory.date.desc())
-                    .first()
-                )
                 
                 if payment:
+                    payment_amount = payment.amount_paid
                     db.delete(payment)
-                    print(f"   ✅ Deleted payment record ID={payment.id}")
                     response["payment_deleted"] = True
+                    response["payment_amount_deleted"] = payment_amount
                     
-                    # ⭐ LIFO: Re-open dues starting from newest sales
+                    # LIFO: Re-open dues starting from newest sales
                     # First, reduce advance from parent account
                     current_advance = advance_customer.advance_payment or 0
-                    remaining_to_reopen = amount_paid
+                    remaining_to_reopen = payment_amount
+                    
+                    # Include the current sale's amount_paid in what needs to be reopened
+                    # (since this sale is being deleted, its payment portion needs to be accounted for)
+                    current_sale_paid = sale.amount_paid or 0
                     
                     if current_advance > 0:
                         advance_reduction = min(current_advance, remaining_to_reopen)
                         advance_customer.advance_payment = current_advance - advance_reduction
                         remaining_to_reopen -= advance_reduction
                         db.add(advance_customer)
-                        print(f"   ✅ Reduced advance by ₹{advance_reduction}, new advance: ₹{advance_customer.advance_payment}")
+                    
+                    # Subtract the current sale's paid amount from remaining (it's being deleted anyway)
+                    remaining_to_reopen -= current_sale_paid
                     
                     # Then re-open dues in LIFO order (newest first) across all linked accounts
                     if remaining_to_reopen > 0:
-                        # Get sales that have been paid (amount_paid > 0) - LIFO order
                         paid_sales = (
                             db.query(Sale)
                             .filter(
                                 Sale.customer_id.in_(account_ids),
                                 Sale.amount_paid > 0,
-                                Sale.id != sale_id  # Exclude the sale being deleted
+                                Sale.id != sale_id
                             )
-                            .order_by(Sale.date.desc(), Sale.id.desc())  # LIFO - newest first
+                            .order_by(Sale.date.desc(), Sale.id.desc())
                             .all()
                         )
                         
@@ -714,18 +684,15 @@ def delete_sale(
                             if remaining_to_reopen <= 0:
                                 break
                             
-                            # How much can we reopen from this sale?
                             can_reopen = min(paid_sale.amount_paid, remaining_to_reopen)
                             paid_sale.amount_paid -= can_reopen
                             paid_sale.due_amount += can_reopen
                             remaining_to_reopen -= can_reopen
                             reopened_count += 1
                             db.add(paid_sale)
-                            print(f"     ↩️ Reopened ₹{can_reopen} due on sale {paid_sale.id}")
                         
                         response["dues_reopened"] = reopened_count
                 else:
-                    print(f"   ⚠️ No matching payment record found")
                     response["payment_deleted"] = False
 
     db.delete(sale)

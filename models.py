@@ -34,9 +34,11 @@ class Sale(Base):
     total_cost = Column(Float, nullable=False)
     amount_paid = Column(Float, nullable=False)
     due_amount = Column(Float, nullable=False)
+    payment_id = Column(Integer, ForeignKey("payment_history.id"), nullable=True)  # Link to payment record
     date = Column(DateTime(timezone=True), server_default=func.now())
 
     customer = relationship("Customer", back_populates="sales")
+    payment = relationship("PaymentHistory")
 
 
 class JarTracking(Base):

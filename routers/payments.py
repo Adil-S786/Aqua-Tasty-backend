@@ -179,15 +179,40 @@ def create_backdated_payment(
     return response
 
 
+@router.get("/{payment_id}/check-linked")
+def check_linked_sale(payment_id: int, db: Session = Depends(get_db)):
+    """Check if a payment has a linked sale via payment_id foreign key."""
+    payment = db.query(PaymentHistory).filter(PaymentHistory.id == payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    
+    linked_sale = db.query(Sale).filter(Sale.payment_id == payment_id).first()
+    
+    return {
+        "has_linked_sale": linked_sale is not None,
+        "linked_sale_id": linked_sale.id if linked_sale else None,
+        "linked_sale_total": linked_sale.total_cost if linked_sale else None
+    }
+
+
 @router.delete("/{payment_id}")
-def delete_payment(payment_id: int, db: Session = Depends(get_db)):
+def delete_payment(
+    payment_id: int, 
+    action: str = "payment_only",  # Options: "payment_only", "delete_sale_also"
+    db: Session = Depends(get_db)
+):
     """
     Delete a payment and REVERT its effect.
     
-    Logic:
-    1. First reduce advance from parent account (if linked) or current account
-    2. If advance goes negative, re-open dues in LIFO order (newest first)
-    3. For linked accounts, re-opens dues across ALL linked accounts
+    Actions:
+    - "payment_only": Break FK link, delete payment, reopen dues via LIFO
+    - "delete_sale_also": Delete both the linked sale and the payment
+    
+    Logic for payment_only:
+    1. Clear payment_id from linked sales
+    2. First reduce advance from parent account (if linked) or current account
+    3. If advance goes negative, re-open dues in LIFO order (newest first)
+    4. For linked accounts, re-opens dues across ALL linked accounts
     """
     payment = db.query(PaymentHistory).filter(PaymentHistory.id == payment_id).first()
     if not payment:
@@ -197,7 +222,37 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
     customer_name = payment.customer_name
     amount_to_revert = payment.amount_paid
     
-    print(f"🗑️ DELETE PAYMENT: ID={payment_id}, Amount=₹{amount_to_revert}, Customer={customer_id or customer_name}")
+    # Check for linked sale
+    linked_sale = db.query(Sale).filter(Sale.payment_id == payment_id).first()
+    
+    # Handle "delete_sale_also" action
+    if action == "delete_sale_also" and linked_sale:
+        from services import recalc_jartracking
+        
+        sale_customer_id = linked_sale.customer_id
+        sale_customer_name = linked_sale.customer_name
+        
+        # Delete the sale first
+        db.delete(linked_sale)
+        # Then delete the payment
+        db.delete(payment)
+        db.commit()
+        
+        # Recalculate jar tracking
+        recalc_jartracking(db, sale_customer_id, sale_customer_name)
+        
+        return {
+            "message": "Payment and linked sale deleted successfully",
+            "deleted_payment_amount": amount_to_revert,
+            "deleted_sale_id": linked_sale.id if linked_sale else None
+        }
+    
+    # For "payment_only" action, clear FK and proceed with LIFO
+    if linked_sale:
+        # Account for the linked sale's amount_paid in the revert calculation
+        linked_sale_paid = linked_sale.amount_paid or 0
+        linked_sale.payment_id = None
+        db.add(linked_sale)
 
     if customer_id:
         # Get customer and determine linked accounts
@@ -222,24 +277,17 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
             if children:
                 account_ids.extend([c.id for c in children])
         
-        print(f"   Advance customer: {advance_customer.id} ({advance_customer.name})")
-        print(f"   All linked account_ids: {account_ids}")
-        
         # Step 1: Reduce advance first
         current_advance = advance_customer.advance_payment or 0
         remaining_to_revert = amount_to_revert
         
         if current_advance > 0:
             if current_advance >= remaining_to_revert:
-                # Advance covers the full revert
                 advance_customer.advance_payment = current_advance - remaining_to_revert
                 remaining_to_revert = 0
-                print(f"   Reduced advance by ₹{amount_to_revert}, new advance=₹{advance_customer.advance_payment}")
             else:
-                # Use all advance, still need to revert more
                 remaining_to_revert -= current_advance
                 advance_customer.advance_payment = 0
-                print(f"   Used all advance (₹{current_advance}), still need to revert ₹{remaining_to_revert}")
             
             db.add(advance_customer)
         
@@ -251,8 +299,6 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
                 .order_by(Sale.date.desc(), Sale.id.desc())  # LIFO - newest first
                 .all()
             )
-            
-            print(f"   Found {len(sales)} sales to potentially re-open dues")
             
             for sale in sales:
                 if remaining_to_revert <= 0:
@@ -267,11 +313,9 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
                     sale.amount_paid = 0
                     sale.due_amount += reversible
                     remaining_to_revert -= reversible
-                    print(f"   Re-opened ₹{reversible} due on sale {sale.id}")
                 else:
                     sale.amount_paid -= remaining_to_revert
                     sale.due_amount += remaining_to_revert
-                    print(f"   Re-opened ₹{remaining_to_revert} due on sale {sale.id}")
                     remaining_to_revert = 0
 
                 db.add(sale)
